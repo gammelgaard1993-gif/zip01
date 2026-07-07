@@ -1,0 +1,39 @@
+# Local infrastructure for the Teton backend: Redis (hot state) + Mosquitto (MQTT).
+# The service itself runs on the host (uvicorn) and connects to these on localhost,
+# matching the defaults in config.py (REDIS_URL / MQTT_BROKER_URL).
+
+services:
+  redis:
+    # Latest stable Redis line. The abandoned native Windows port is stuck at 3.0.504, which
+    # predates variadic HSET (added in 4.0) and breaks the presence handler; run a modern build
+    # via Docker instead. 8.x supports every command our handlers use (SET EX/NX, zsets,
+    # variadic HSET, pipelines).
+    image: redis:8-alpine
+    container_name: teton-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: teton-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # Back the persistence_location (mosquitto.conf) with a named volume so the
+      # on-disk QoS 1 state survives container recreation, not just restarts.
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -W 3 -q 1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mosquitto-data:
