@@ -259,7 +259,7 @@ caller that could be lost in a crash.
 |---|---|---|
 | **0 — today** | Single process, in-proc queue, SQLite, one Redis. Unblock the event loop (executor or async Redis). | ~5–10k events/s on one box |
 | **1 — vertical** | Multiple worker processes; swap SQLite → Postgres/Timescale; managed Redis. | Tens of thousands/s |
-| **2 — partitioned log** | Introduce Kafka/Redpanda. Ingestion produces, workers consume by partition. Keep handler logic. **This is the inflection point** — horizontally scalable, replay-safe, priority-isolated. | 50k+ events/s, multi-node |
+| **2 — partitioned log** | Introduce Kafka(or Redpanda). Ingestion produces, workers consume by partition. Keep handler logic. **This is the inflection point** — horizontally scalable, replay-safe, priority-isolated. | 50k+ events/s, multi-node |
 | **3 — stateful stream processing** | Move aggregation to Flink/Kafka-Streams with event-time windows + checkpoints when exactly-once and complex windowing justify the operational cost. | 100k+ events/s, multi-region |
 | **4 — multi-region + redundant delivery** | Geo-replication, escalation paths, DR drills. | Life-safety SLA, regulatory |
 
@@ -322,15 +322,25 @@ python main.py
 ```
 
 ---
+### Staged Migration Path (don't rip-and-replace)
 
-## 7. With Another Week
+| Stage | Change | When |
+|---|---|---|
+| **0 — today** | Single process, in-proc queue, SQLite, one Redis. Unblock the event loop (executor or async Redis). | ~5–10k events/s on one box |
+| **1 — vertical** | Multiple worker processes; swap SQLite → Postgres/Timescale; managed Redis. | Tens of thousands/s |
+| **2 — partitioned log** | Introduce Kafka(or Redpanda). Ingestion produces, workers consume by partition. Keep handler logic. **This is the inflection point** — horizontally scalable, replay-safe, priority-isolated. | 50k+ events/s, multi-node |
+| **3 — stateful stream processing** | Move aggregation to Flink/Kafka-Streams with event-time windows + checkpoints when exactly-once and complex windowing justify the operational cost. | 100k+ events/s, multi-region |
+| **4 — multi-region + redundant delivery** | Geo-replication, escalation paths, DR drills. | Life-safety SLA, regulatory |
+
+Each stage is independently shippable and reversible.
+## With Another Week
 
 1. **Unblock the event loop.** Move synchronous Redis + SQLite calls into
    `loop.run_in_executor()` (or adopt `redis.asyncio` + a dedicated async
    writer task for persistence) to eliminate the ~1.5 s POST latency under
    load and lift sustained throughput from ~0.6 events/s to the nominal 5k+
    the single-box ceiling allows.
-2. **Add Prometheus/Grafana dashboards** over the existing counters with
+2. **Add Grafana dashboards** over the existing counters with
    SLO burn-rate alerts on alarm p95 and fast-lane lag.
 3. **Replace the in-process burst surrogate** in tests with a full
    broker-backed 50k/sec concurrent load test.
