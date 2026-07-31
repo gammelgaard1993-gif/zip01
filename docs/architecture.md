@@ -50,10 +50,15 @@ Shutdown sequence:
 
 - `api.routes.events.ingest_event` (primary transport, `POST /events`)
   - Accepts one flat JSON event per request; responds `202 Accepted`.
+  - Rejects oversized bodies with `413` (`{"error": "payload_too_large"}`, counts
+    `events_rejected_too_large`) before parsing: checks the declared `Content-Length`, then the
+    actual byte length, against `MAX_EVENT_BYTES` (16 KB).
   - Rejects non-JSON / non-object bodies with `400` (counts `events_rejected_invalid_json`).
   - Delegates acceptance rules to the validator.
   - Applies backpressure through the HTTP response: a full NORMAL lane makes `event_queue.put`
-    await, delaying the `202` instead of dropping the event. HIGH `fall_warn` returns immediately.
+    await, delaying the `202` instead of dropping the event. HIGH `fall_warn` returns immediately
+    under normal/burst load; only a saturated HIGH lane (`HIGH_QUEUE_MAX_SIZE`) backpressures, and
+    it never drops `fall_warn`.
 
 - `ingestion.mqtt_subscriber.MQTTSubscriber` (optional secondary transport, off by default)
   - Subscribes to `teton/devices/+/events` at QoS 1.
@@ -72,7 +77,8 @@ Shutdown sequence:
 
 - `ingestion.queue.PriorityEventQueue`
   - Maintains two queues:
-    - `high_queue`: unbounded
+    - `high_queue`: bounded (`HIGH_QUEUE_MAX_SIZE`, default 100,000). Sized far above any real
+      `fall_warn` burst; `put()` awaits capacity only under an adversarial flood and never drops.
     - `normal_queue`: bounded (configurable, default 500,000)
   - `get()` always drains high lane first.
 
@@ -91,7 +97,8 @@ Shutdown sequence:
   - `HeartbeatHandler`: updates device last heartbeat and heartbeat history in Redis.
   - `PresenceHandler`: updates room occupancy transitions and latest state in Redis.
   - `FallWarnHandler`: deduplicates, persists alarms to SQLite, publishes to alarm bus.
-  - `GenericEventHandler`: currently no-op; event persistence is already done in worker flow.
+  - `GenericEventHandler`: no-op beyond persistence (already done in worker flow); handles
+    `motion`, `sleep_state`, `net_status`, and is the fallback for any unmapped event type.
 
 - `processing.alarm_bus.AlarmBus`
   - Per-room subscribers with async queues.

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from sqlite3 import Connection
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import config
 from api.dependencies import get_alarm_bus, get_db_connection
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus
@@ -38,7 +40,14 @@ async def get_alarms(
     # `since` is a float epoch (matches the reference stub). Convert to a UTC ISO string so it
     # compares lexically against the stored `ts` (also UTC isoformat). Defaults to 0 (epoch),
     # which returns the full history.
-    since_iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).timestamp()
+    max_since = now + config.EVENT_FUTURE_LIMIT.total_seconds()  # mirror the clock-skew tolerance
+    if not math.isfinite(since) or since < 0.0 or since > max_since:
+        raise HTTPException(status_code=400, detail="invalid since")
+    try:
+        since_iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid since")
     cursor = db_connection.cursor()
     query = "SELECT device_id, room_id, ts, confidence, received_at FROM fall_warnings"
     params: list[Any] = [since_iso]

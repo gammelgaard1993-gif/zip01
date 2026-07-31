@@ -28,6 +28,9 @@ REDIS_SOCKET_TIMEOUT_SECONDS = 5
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 NORMAL_QUEUE_MAX_SIZE = 500_000
+# Very large bound far above any real fall_warn burst (fall_warn is dedup-gated), so it only
+# triggers backpressure under an adversarial flood — it awaits capacity, never a silent drop.
+HIGH_QUEUE_MAX_SIZE = 100_000
 WORKER_COUNT = 8
 # Experimental I/O offload (A/B benchmark switch; see tools/bench.py). When enabled, the worker
 # pool moves the blocking per-event SQLite INSERT+commit off the single uvicorn event loop and
@@ -46,6 +49,8 @@ OCCUPANCY_WINDOW_SECONDS = 3600
 LATE_EVENT_THRESHOLD_SECONDS = 30
 EVENT_FUTURE_LIMIT = timedelta(hours=1)
 EVENT_PAST_LIMIT = timedelta(hours=1)
+# Real events are a few hundred bytes; this is a generous ceiling to bound per-request memory.
+MAX_EVENT_BYTES = 16_384
 
 STATE_SNAPSHOT_INTERVAL_SECONDS = 60
 

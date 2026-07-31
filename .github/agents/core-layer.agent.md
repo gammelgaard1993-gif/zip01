@@ -1,7 +1,7 @@
 ---
 name: "Core Layer Specialist"
 description: "Use for zip01 core infrastructure: durable storage, Redis state client, event persistence, metrics plumbing, and recovery/snapshot/replay paths. Keywords: core, sqlite, redis, event log, recovery, replay, snapshot, metrics."
-tools: [vscode, execute, read, edit, search, 'pylance-mcp-server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
+tools: [execute, read, edit, search, 'pylance mcp server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
 user-invocable: true
 ---
 

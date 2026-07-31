@@ -1,7 +1,7 @@
 ---
 name: "Testing Specialist"
 description: "Use for creating and hardening zip01 tests: regression coverage, edge cases, concurrency/order/backpressure, and behavior-level verification. Keywords: tests, unittest, async tests, regression, coverage, dedup, ordering, recovery."
-tools: [vscode, execute, read, edit, search, 'pylance-mcp-server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
+tools: [execute, read, edit, search, 'pylance mcp server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
 user-invocable: true
 ---
 

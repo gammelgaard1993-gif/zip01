@@ -1,7 +1,7 @@
 ---
 name: "API Layer Specialist"
 description: "Use for FastAPI read/stream endpoints, request/response contracts, dependency wiring, and app lifecycle in zip01. Keywords: api, FastAPI, routes, dependencies, app.state, alarms stream, metrics, health, occupancy."
-tools: [vscode, execute, read, edit, search, 'pylance-mcp-server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
+tools: [execute, read, edit, search, 'pylance mcp server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
 user-invocable: true
 ---
 

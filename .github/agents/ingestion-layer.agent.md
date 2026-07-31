@@ -1,7 +1,7 @@
 ---
 name: "Ingestion Layer Specialist"
 description: "Use for zip01 MQTT intake, event validation, priority assignment, and queue/backpressure behavior from broker delivery into processing. Keywords: ingestion, MQTT, paho, validator, queue, backpressure, priority, ack."
-tools: [vscode, execute, read, edit, search, 'pylance-mcp-server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
+tools: [execute, read, edit, search, 'pylance mcp server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
 user-invocable: true
 ---
 

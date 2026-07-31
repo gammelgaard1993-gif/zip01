@@ -34,13 +34,17 @@ Inputs:
 
 Outputs:
 - `202 Accepted` (`{"status": "accepted"}`) on success; `202` with
-  `{"status": "rejected", "reason": ...}` on clock-skew rejects; `400` on invalid JSON or schema.
+  `{"status": "rejected", "reason": ...}` on clock-skew rejects; `413`
+  (`{"error": "payload_too_large"}`) on oversized bodies; `400` on invalid JSON or schema.
 
 Side effects:
+- Rejects bodies over `MAX_EVENT_BYTES` (16 KB) with `413` before parsing (checks declared
+  `Content-Length` then actual byte length) and increments `events_rejected_too_large`.
 - Increments `events_ingested_total`, reject counters, and `queue_pressure` when the NORMAL
   lane is full.
 - `await event_queue.put(...)` applies backpressure: a full NORMAL lane delays the response;
-  HIGH `fall_warn` returns immediately. Events are never dropped.
+  HIGH `fall_warn` returns immediately under normal/burst load and awaits capacity only when the
+  bounded HIGH lane (`HIGH_QUEUE_MAX_SIZE`) is saturated. Events are never dropped.
 
 ### `ingestion.mqtt_subscriber.MQTTSubscriber._on_message(...)` (optional transport, off by default)
 
@@ -162,7 +166,8 @@ Purpose:
 - Compute occupancy percentage for selected window from transition history.
 
 Inputs:
-- `room_id`, `window` in `{1m, 5m, 1h}`.
+- `room_id`, `window` accepting `Nm` (minutes), `Nh` (hours), or bare `N` (seconds); default
+  `5m`. Invalid or non-positive windows return `400`.
 
 Outputs:
 - Current occupancy state and fractional occupancy for window.

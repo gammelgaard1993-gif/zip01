@@ -1,7 +1,7 @@
 ---
 name: "Mosquitto Layer Specialist"
 description: "Use for zip01 broker configuration and broker-level delivery/backpressure behavior. Keywords: mosquitto, mqtt broker, inflight, qos, listener, docker-compose."
-tools: [vscode, execute, read, edit, search]
+tools: [execute, read, edit, search]
 user-invocable: true
 ---
 

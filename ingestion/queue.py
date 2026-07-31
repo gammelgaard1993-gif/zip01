@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
+from config import HIGH_QUEUE_MAX_SIZE
 from models import Priority, ValidatedEvent
 
 class PriorityEventQueue:
     def __init__(self, normal_max_size: int) -> None:
-        self.high_queue: asyncio.Queue[ValidatedEvent] = asyncio.Queue()
+        self.high_queue: asyncio.Queue[ValidatedEvent] = asyncio.Queue(maxsize=HIGH_QUEUE_MAX_SIZE)
         self.normal_queue: asyncio.Queue[ValidatedEvent] = asyncio.Queue(maxsize=normal_max_size)
         self._normal_max_size = normal_max_size
 

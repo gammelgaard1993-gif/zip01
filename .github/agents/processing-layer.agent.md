@@ -1,7 +1,7 @@
 ---
 name: "Processing Layer Specialist"
 description: "Use for zip01 processing flow: worker routing, ordering buffers, event handlers, dedup behavior, and alarm bus dispatch semantics. Keywords: processing, worker pool, handlers, ordering, dedup, alarm bus."
-tools: [vscode, execute, read, edit, search, 'pylance-mcp-server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
+tools: [execute, read, edit, search, 'pylance mcp server/*', ms-python.python/getPythonEnvironmentInfo, ms-python.python/getPythonExecutableCommand, ms-python.python/installPythonPackage, ms-python.python/configurePythonEnvironment]
 user-invocable: true
 ---
 

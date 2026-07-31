@@ -6,6 +6,9 @@
 
 - `POST /events` receives one flat JSON event per request (primary path); the optional MQTT
   subscriber feeds the same validator + queue when `ENABLE_MQTT=True`.
+- Oversized bodies are rejected with `413` (`{"error": "payload_too_large"}`, counted
+  `events_rejected_too_large`) before JSON parsing/validation: the declared `Content-Length` and
+  the actual byte length are checked against `MAX_EVENT_BYTES` (16 KB).
 - The body is parsed as a JSON object.
 - Non-JSON or non-object bodies are rejected with `400` and counted
   (`events_rejected_invalid_json`).
@@ -17,11 +20,14 @@
 
 ### 2) Queueing and Backpressure
 
-- `fall_warn` is sent to the unbounded high lane and returns immediately.
+- `fall_warn` is sent to the bounded high lane (`HIGH_QUEUE_MAX_SIZE`, default 100,000) and
+  returns immediately under normal/burst load; the lane awaits capacity only under an adversarial
+  `fall_warn` flood and never drops.
 - Other types are sent to the bounded normal lane (default 500,000).
 - On the HTTP path, a full normal lane makes `event_queue.put` await, so the `202` response is
   delayed until capacity frees up; the event is never dropped. A full lane also increments
-  `queue_pressure`. HIGH `fall_warn` is never stalled behind NORMAL (no priority inversion).
+  `queue_pressure`. HIGH `fall_warn` is not stalled behind NORMAL (no priority inversion); a
+  saturated HIGH lane backpressures rather than dropping.
 - On the optional MQTT path, the same full lane pauses NORMAL delivery without blocking the
   MQTT thread, so HIGH `fall_warn` keeps flowing.
 

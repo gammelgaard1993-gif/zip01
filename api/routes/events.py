@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Request, Response
 
+import config
 from core.metrics import increment_counter
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
@@ -23,9 +24,28 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
     # instead of dropping the event).
     increment_counter("events_ingested_total")
 
+    # 0) Bound per-request memory. Reject an oversized body before buffering/parsing it: check the
+    #    declared Content-Length first, then the actual bytes (defends against a missing/lying header).
+    headers = getattr(request, "headers", None)
+    declared_length = headers.get("content-length") if headers is not None else None
+    if declared_length is not None:
+        try:
+            if int(declared_length) > config.MAX_EVENT_BYTES:
+                increment_counter("events_rejected_too_large")
+                response.status_code = 413
+                return {"error": "payload_too_large"}
+        except (TypeError, ValueError):
+            pass
+
+    body = await request.body()
+    if len(body) > config.MAX_EVENT_BYTES:
+        increment_counter("events_rejected_too_large")
+        response.status_code = 413
+        return {"error": "payload_too_large"}
+
     # 1) Parse body. Non-JSON or non-object -> 400.
     try:
-        raw = json.loads(await request.body())
+        raw = json.loads(body)
     except (ValueError, json.JSONDecodeError):
         increment_counter("events_rejected_invalid_json")
         response.status_code = 400
