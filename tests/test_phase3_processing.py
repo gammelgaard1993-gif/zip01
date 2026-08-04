@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from unittest.mock import patch
 
-from config import WORKER_COUNT
+from config import WORKER_COUNT, WORKER_NORMAL_QUEUE_MAX_SIZE
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
 from processing.alarm_bus import AlarmBus
@@ -178,6 +178,38 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool_internal._worker_index("dev_1"), pool_internal._worker_index("dev_1"))
         self.assertTrue(0 <= pool_internal._worker_index("dev_2") < WORKER_COUNT)
 
+    async def test_worker_lanes_are_bounded_and_high_drains_before_normal(self) -> None:
+        # #1: each worker owns a bounded two-lane priority queue, so a HIGH event never waits behind
+        # a NORMAL backlog already routed to the same worker, and the lane cannot grow unbounded.
+        pool = WorkerPool(PriorityEventQueue(10), AlarmBus(), self.db, cast(Any, FakeRedis()))
+        for worker_queue in pool.worker_queues:
+            self.assertIsInstance(worker_queue, PriorityEventQueue)
+            self.assertEqual(worker_queue.normal_max_size(), WORKER_NORMAL_QUEUE_MAX_SIZE)
+
+        lane = pool.worker_queues[0]
+        await lane.put(self._event("motion"))  # NORMAL backlog
+        await lane.put(self._event("motion"))
+        await lane.put(self._event("fall_warn"))  # HIGH arrives after the NORMAL backlog
+        first = await lane.get()
+        self.assertEqual(first.priority, Priority.HIGH)
+
+    async def test_stop_drains_buffered_events_before_shutdown(self) -> None:
+        # #3: an event enqueued right before shutdown still has its handler applied during the
+        # bounded graceful drain, even though stop() is called before the 100ms reorder flush.
+        applied: list[str] = []
+
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            applied.append(event.device_id)
+
+        queue = PriorityEventQueue(50)
+        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await queue.put(self._event("motion", device_id="dev_drain"))
+            await pool.stop()  # graceful drain must flush the buffered event
+
+        self.assertIn("dev_drain", applied)
+
     async def test_worker_pool_error_isolation_continues_processing(self) -> None:
         queue = PriorityEventQueue(20)
         pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
@@ -196,8 +228,9 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.6)
             await pool.stop()
 
-        rows = self.db.execute("SELECT COUNT(*) FROM events WHERE type='motion'").fetchone()[0]
-        self.assertEqual(rows, 2)
+        # Error isolation: the first handler raised, but the worker still processed the second
+        # event (durability is owned by admission, not the worker, so nothing is persisted here).
+        self.assertEqual(call_count["n"], 2)
 
     async def test_heartbeat_handler_updates_last_and_availability(self) -> None:
         redis_client = FakeRedis()
@@ -237,16 +270,15 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row_count, 1)
         self.assertEqual(len(alarm_bus.published), 1)
 
-    async def test_generic_event_types_persist_via_worker_flow(self) -> None:
-        queue = PriorityEventQueue(20)
-        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
-        await pool.start()
+    async def test_generic_event_types_persist_via_admission(self) -> None:
+        # Durability now happens at admission (the /events route and MQTT enqueue call
+        # persist_validated_event before ack), not in the worker. Every event type lands in the
+        # durable `events` log via that path.
+        from core.event_log import persist_validated_event
 
-        await queue.put(self._event("motion", payload={"a": 1}))
-        await queue.put(self._event("sleep_state", payload={"a": 2}))
-        await queue.put(self._event("net_status", payload={"a": 3}))
-        await asyncio.sleep(0.6)
-        await pool.stop()
+        persist_validated_event(self.db, self._event("motion", payload={"a": 1}))
+        persist_validated_event(self.db, self._event("sleep_state", payload={"a": 2}))
+        persist_validated_event(self.db, self._event("net_status", payload={"a": 3}))
 
         rows = self.db.execute("SELECT type, payload FROM events ORDER BY id ASC").fetchall()
         self.assertEqual([row[0] for row in rows], ["motion", "sleep_state", "net_status"])

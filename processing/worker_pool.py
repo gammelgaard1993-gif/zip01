@@ -3,12 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from sqlite3 import Connection
 from typing import Dict, List
 
-from config import DEVICE_REORDER_BUFFER_MS, WORKER_COUNT, USE_EXECUTOR_IO
-from core.event_log import persist_validated_event
+from config import DEVICE_REORDER_BUFFER_MS, WORKER_COUNT, WORKER_NORMAL_QUEUE_MAX_SIZE
 from ingestion.queue import PriorityEventQueue
 from models import ValidatedEvent
 from processing.handlers.base import EventHandler
@@ -34,35 +32,49 @@ class WorkerPool:
         self.alarm_bus: AlarmBus = alarm_bus
         self.db_connection: Connection = db_connection
         self.redis_client: Redis = redis_client
-        self.worker_queues: List[asyncio.Queue[ValidatedEvent]] = [asyncio.Queue() for _ in range(WORKER_COUNT)]
+        # Each worker owns a bounded two-lane priority queue: HIGH (fall_warn) is drained before
+        # NORMAL, so downstream routing preserves priority and can never grow an unbounded FIFO.
+        self.worker_queues: List[PriorityEventQueue] = [
+            PriorityEventQueue(WORKER_NORMAL_QUEUE_MAX_SIZE) for _ in range(WORKER_COUNT)
+        ]
         self.workers: List[asyncio.Task[None]] = []
         self.router_task: asyncio.Task[None] | None = None
         self.flush_tasks: set[asyncio.Task[None]] = set()
         self.reorder_buffer_seconds = DEVICE_REORDER_BUFFER_MS / 1000.0
-        # Experimental I/O offload (config.USE_EXECUTOR_IO). A single-worker thread pool serialises
-        # the blocking SQLite writes off the event loop. max_workers=1 is deliberate: the sqlite3
-        # connection is not safe for concurrent use from multiple threads, so funnelling every
-        # write through one thread keeps them ordered while still freeing the loop during the I/O.
-        self._io_executor: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="io-writer") if USE_EXECUTOR_IO else None
-        )
 
     async def start(self) -> None:
         self.workers = [asyncio.create_task(self._worker_loop(index, queue)) for index, queue in enumerate(self.worker_queues)]
         self.router_task = asyncio.create_task(self._router_loop())
 
-    async def stop(self) -> None:
+    async def stop(self, drain: bool = True, drain_timeout: float = 2.0) -> None:
+        # Graceful drain: enqueued events are already durable (persisted at admission), so draining
+        # here just applies their remaining hot-state handlers now instead of on the next restart.
+        # Bounded by drain_timeout so shutdown can never hang; anything still unprocessed at the
+        # deadline is simply replayed from the durable log on restart.
+        if drain:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + drain_timeout
+            # 1) Let the router move everything from the global queue into the worker lanes.
+            while loop.time() < deadline:
+                if self.event_queue.qsize_high() == 0 and self.event_queue.qsize_normal() == 0:
+                    break
+                await asyncio.sleep(0.02)
+            # 2) Let the workers drain their lanes and finish any buffered per-device flushes.
+            while loop.time() < deadline:
+                lanes_pending = any(
+                    q.qsize_high() or q.qsize_normal() for q in self.worker_queues
+                )
+                if not lanes_pending and not self.flush_tasks:
+                    break
+                await asyncio.sleep(0.02)
         if self.router_task:
             self.router_task.cancel()
         for worker in self.workers:
             worker.cancel()
-        for flush_task in self.flush_tasks:
+        for flush_task in list(self.flush_tasks):
             flush_task.cancel()
         await asyncio.gather(*(t for t in self.workers if not t.done()), return_exceptions=True)
         await asyncio.gather(*(t for t in self.flush_tasks if not t.done()), return_exceptions=True)
-        # Tear down the offload thread (if enabled) so the process can exit cleanly.
-        if self._io_executor is not None:
-            self._io_executor.shutdown(wait=False)
 
     async def _router_loop(self) -> None:
         # Single consumer of the priority queue. It only routes (never handles) so the HIGH lane
@@ -79,7 +91,7 @@ class WorkerPool:
         digest = hashlib.sha256(device_id.encode("utf-8")).digest()
         return digest[0] % len(self.worker_queues)
 
-    async def _worker_loop(self, index: int, queue: asyncio.Queue[ValidatedEvent]) -> None:
+    async def _worker_loop(self, index: int, queue: PriorityEventQueue) -> None:
         device_buffers: Dict[str, List[ValidatedEvent]] = {}
         flush_tasks: Dict[str, asyncio.Task[None]] = {}
         handlers: dict[str, EventHandler] = {
@@ -137,25 +149,17 @@ class WorkerPool:
                 # Re-sort on each iteration: an event may have been appended during the await above.
                 device_events.sort(key=lambda item: item.ts)
                 next_event = device_events.pop(0)
-                # Persist-before-handle: the durable SQLite record is the source of truth for
-                # recovery/replay, so it must land even if the in-memory handler below fails.
-                if self._io_executor is not None:
-                    # Offload the blocking INSERT+commit to the writer thread. It is still awaited
-                    # before the handler runs, so the persist-before-handle durability rule holds;
-                    # the only change is the event loop is free to serve other devices during the
-                    # disk write instead of blocking on it.
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        self._io_executor, persist_validated_event, self.db_connection, next_event
-                    )
-                else:
-                    persist_validated_event(self.db_connection, next_event)
+                # Durability already happened at admission: the /events route and the MQTT enqueue
+                # path persist the event to SQLite before acknowledging it. The worker owns only the
+                # derived hot state, so a handler failure here is isolated and never risks the
+                # durable record.
                 handler = handlers.get(next_event.type, handlers["motion"])
                 try:
                     await handler.handle(next_event)
                 except Exception:
                     # Failure isolation: a single handler error is logged and skipped so it can't
-                    # kill the worker or stall this device's buffer. The event is already durable.
+                    # kill the worker or stall this device's buffer. The event is already durable
+                    # (persisted at admission), so only recoverable hot state is affected.
                     logger.exception(
                         "worker handler failure",
                         extra={

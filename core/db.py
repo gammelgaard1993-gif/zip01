@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS fall_warnings (
 );
 CREATE INDEX IF NOT EXISTS idx_fall_ts ON fall_warnings(ts);
 CREATE INDEX IF NOT EXISTS idx_fall_room ON fall_warnings(room_id, ts);
+CREATE INDEX IF NOT EXISTS idx_fall_ts_id ON fall_warnings(ts, id);
+CREATE INDEX IF NOT EXISTS idx_fall_room_ts_id ON fall_warnings(room_id, ts, id);
 
 CREATE TABLE IF NOT EXISTS state_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -27,6 +27,8 @@ Defined in `core/db.py`:
   - Durable deduplicated fall alarms
     (`device_id`, `room_id`, `ts`, `confidence`, `dedup_key`, `received_at`).
   - Uniqueness enforced by `UNIQUE(dedup_key)`.
+  - Composite `(ts, id)` and `(room_id, ts, id)` indexes support stable bounded keyset reads for
+    complete alarm-list responses and race-free SSE replay.
 - `state_snapshots`
   - Periodic serialized capture of managed Redis state (`snapshot_ts`, `state_json`).
 
@@ -36,8 +38,12 @@ committed transactions except on OS/power loss (which snapshot + replay recovery
 
 ## Persistence Semantics
 
-- Every flushed worker event is inserted into `events` before handler-specific logic.
+- Every accepted event is inserted into `events` at admission — before the `POST /events` `202`
+  and before the MQTT puback — so durability never depends on the worker finishing. A storage
+  error surfaces as `503` / a withheld ack instead of a false accept.
 - `fall_warn` handler inserts into `fall_warnings` after Redis dedup acceptance.
+- After commit, the inserted row ID is attached to the live `AlarmEvent`, allowing SSE consumers
+  to suppress replay/live overlap without missing or duplicating alarms.
 - Commits are explicit (`db_connection.commit()`) per insertion path.
 
 ## Snapshot Semantics

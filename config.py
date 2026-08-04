@@ -1,4 +1,3 @@
-import os
 from datetime import timedelta
 
 # HTTP ingestion / API server (primary transport). The reference generator POSTs one flat JSON
@@ -32,17 +31,16 @@ NORMAL_QUEUE_MAX_SIZE = 500_000
 # triggers backpressure under an adversarial flood — it awaits capacity, never a silent drop.
 HIGH_QUEUE_MAX_SIZE = 100_000
 WORKER_COUNT = 8
-# Experimental I/O offload (A/B benchmark switch; see tools/bench.py). When enabled, the worker
-# pool moves the blocking per-event SQLite INSERT+commit off the single uvicorn event loop and
-# onto a dedicated background thread, so the loop stays free to process other devices' handlers
-# during the disk write. Off by default so runtime behaviour is unchanged unless explicitly
-# opted in via USE_EXECUTOR_IO=1 in the environment.
-USE_EXECUTOR_IO = os.getenv("USE_EXECUTOR_IO", "0") == "1"
+# Per-worker NORMAL lane bound. Each worker owns a two-lane priority queue (HIGH drained first),
+# so a full worker NORMAL lane backpressures the router (and in turn the HTTP/MQTT ingress)
+# instead of growing an unbounded downstream FIFO. HIGH uses HIGH_QUEUE_MAX_SIZE per worker.
+WORKER_NORMAL_QUEUE_MAX_SIZE = 100_000
 # Two sequential reorder stages (per-device in the worker pool, per-room in the alarm bus)
 # sit on the alarm hot path. Keep each at 100ms so the cumulative reorder budget stays well
 # under the 1s p95 alarm-delivery target, even with queue draining + handler time on top.
 DEVICE_REORDER_BUFFER_MS = 100
 ALARM_REORDER_BUFFER_MS = 100
+ALARM_REPLAY_BATCH_SIZE = 500
 
 HEARTBEAT_WINDOW_SECONDS = 300
 OCCUPANCY_WINDOW_SECONDS = 3600

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from typing import Any, cast
 
 from fastapi import APIRouter, Request, Response
 
 import config
+from core.event_log import persist_validated_event
 from core.metrics import increment_counter
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
@@ -92,8 +94,29 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
         response.status_code = 400
         return {"error": reason}
 
-    # 3) Enqueue. HIGH returns immediately; a full NORMAL lane awaits capacity (backpressure:
-    #    the HTTP response is delayed, the event is never dropped).
+    # 3) Persist-before-ack: write the durable `events` row BEFORE returning 202, so an accepted
+    #    event survives a crash even though its hot-state handler runs later. On a storage error
+    #    the event is NOT acknowledged (503) and NOT enqueued, so the client can retry (no false
+    #    accept, no silent loss).
+    db_connection: sqlite3.Connection = request.app.state.db_connection
+    try:
+        persist_validated_event(db_connection, validated)
+    except sqlite3.Error:
+        increment_counter("events_persist_failed")
+        logger.error(
+            json.dumps(
+                {
+                    "event": "persist_failed",
+                    "device_id": validated.device_id,
+                    "type": validated.type,
+                }
+            )
+        )
+        response.status_code = 503
+        return {"error": "persist_failed"}
+
+    # 4) Enqueue for hot-state processing. HIGH returns immediately; a full NORMAL lane awaits
+    #    capacity (backpressure: the HTTP response is delayed, the event is never dropped).
     event_queue: PriorityEventQueue = request.app.state.event_queue
     if validated.priority == Priority.NORMAL and event_queue.normal_is_full():
         increment_counter("queue_pressure")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -9,6 +10,17 @@ from ingestion.mqtt_subscriber import MQTTSubscriber
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
 from models import Priority, ValidatedEvent
+
+
+def _events_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL, "
+        "received_at TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    return connection
 
 
 class _FakeMQTTMessage:
@@ -104,7 +116,7 @@ class Phase2MQTTSubscriberTests(unittest.TestCase):
 
     def test_on_connect_subscribes_with_qos_1(self) -> None:
         queue = PriorityEventQueue(normal_max_size=5)
-        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
         client = MagicMock()
 
         cast(Any, subscriber)._on_connect(client, None, {}, 0)
@@ -114,7 +126,7 @@ class Phase2MQTTSubscriberTests(unittest.TestCase):
     @patch("ingestion.mqtt_subscriber.increment_counter")
     def test_on_message_rejects_invalid_json(self, increment_counter_mock: MagicMock) -> None:
         queue = PriorityEventQueue(normal_max_size=5)
-        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
         subscriber.loop = cast(Any, MagicMock())  # not used on invalid input path
 
         cast(Any, subscriber)._on_message(MagicMock(), None, _FakeMQTTMessage(b"{invalid"))
@@ -132,7 +144,7 @@ class Phase2MQTTSubscriberTests(unittest.TestCase):
         run_threadsafe_mock: MagicMock,
     ) -> None:
         queue = PriorityEventQueue(normal_max_size=1)
-        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
         subscriber.loop = cast(Any, MagicMock())
 
         validated = self._validated_event(event_type="heartbeat")

@@ -41,3 +41,4 @@ class AlarmEvent:
     ts: datetime
     confidence: float
     received_at: datetime
+    fall_warning_id: int | None = None

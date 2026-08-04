@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             broker_port=MQTT_BROKER_PORT,
             topic=MQTT_TOPIC,
             event_queue=app.state.event_queue,
+            db_connection=app.state.db_connection,
         )
 
     recovery_manager = RecoveryManager(
@@ -70,6 +71,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery_manager = getattr(app.state, "recovery_manager", None)
         if recovery_manager is not None:
             await recovery_manager.stop_snapshot_loop()
+            # Final snapshot of the drained hot state so restart recovery is fast and current.
+            # Guarded: a storage/Redis hiccup at shutdown must not break teardown (the durable
+            # event log still allows a full replay).
+            try:
+                recovery_manager.write_snapshot()
+            except Exception:
+                logging.exception("final snapshot on shutdown failed")
 
         db_connection = getattr(app.state, "db_connection", None)
         if db_connection is not None:

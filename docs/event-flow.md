@@ -17,6 +17,11 @@
   - queue priority (`fall_warn` -> HIGH, else NORMAL)
 - Schema failures return `400`; clock-skew rejections return `202` with
   `{"status": "rejected", "reason": ...}`.
+- Persist-before-ack: a validated event is written to the durable SQLite `events` log **before**
+  the `202` (and, on the MQTT path, before the puback), so an acknowledged event survives a crash
+  even though its hot-state handler runs later. A storage error returns `503`
+  (`{"error": "persist_failed"}`, counted `events_persist_failed`) and the event is neither
+  enqueued nor acknowledged, so the client can retry (no false accept, no silent loss).
 
 ### 2) Queueing and Backpressure
 
@@ -35,6 +40,9 @@
 
 - Router loop pops from the priority queue, preferring the high lane.
 - Event is assigned to a worker by `sha256(device_id)` first byte mod `WORKER_COUNT`.
+- Each worker owns a bounded two-lane priority queue (HIGH drained before NORMAL), so a HIGH
+  `fall_warn` never waits behind a NORMAL backlog already routed to that worker, and the lane
+  cannot grow unbounded (a full NORMAL lane backpressures the router).
 - Worker stores events in a per-device buffer and sorts by event `ts`.
 - Flush task waits the reorder window (`DEVICE_REORDER_BUFFER_MS`, 100ms), then processes oldest first.
 
@@ -42,9 +50,13 @@
 
 For each flushed event:
 
-1. Persist event row in SQLite `events`.
-2. Dispatch to type-specific handler.
-3. On handler error, log and continue processing remaining events.
+### 4) Handler Dispatch
+
+Durability already happened at admission (step 1), so the worker owns only the derived hot state.
+For each flushed event:
+
+1. Dispatch to type-specific handler.
+2. On handler error, log and continue processing remaining events (the durable record is safe).
 
 ### 5) Type-specific State Effects
 
@@ -62,7 +74,8 @@ For each flushed event:
 - `fall_warn`
   - Build dedup key from device, room, and second-truncated timestamp.
   - `SET NX EX` in Redis for dedup window.
-  - If new: insert into SQLite `fall_warnings`, publish to alarm bus.
+  - If new: insert into SQLite `fall_warnings`, commit, then publish the alarm with its durable
+    `fall_warning_id` to the alarm bus.
   - If duplicate in Redis window: count dedup and stop.
   - If Redis misses but SQLite unique key conflicts: on the live path this is a real post-TTL
     duplicate and counts as dedup; during recovery replay it is an expected re-apply and counts
@@ -80,7 +93,18 @@ For each flushed event:
 4. Alarm bus dispatches after reorder delay to each subscriber queue.
 5. At dispatch, the alarm bus records feed latency from `received_at` (so it is measured even
    with no stream client connected).
-6. `/alarms/stream` yields SSE `data:` frames per alarm.
+6. `/alarms/stream` subscribes before historical replay, captures a durable high-water ID, and
+  replays matching alarms in bounded `(ts, id)` batches.
+7. Buffered alarms already covered by replay are suppressed by durable ID; newer buffered alarms
+  are then yielded as SSE `data:` frames, so the replay/live boundary has no gap.
+
+## Alarm History Read Path
+
+1. `/alarms` validates `since` and captures the maximum matching SQLite row ID.
+2. Matching rows through that boundary are read in bounded `(ts, id)` keyset batches.
+3. The existing `{"alarms": [...], "since": ...}` JSON shape is streamed incrementally while
+  still returning every matching persisted alarm; there is no silent hard-limit truncation.
+4. Alarms inserted after the captured boundary remain retrievable in the next request.
 
 ## Recovery Path
 

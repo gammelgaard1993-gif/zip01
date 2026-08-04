@@ -35,11 +35,15 @@ Inputs:
 Outputs:
 - `202 Accepted` (`{"status": "accepted"}`) on success; `202` with
   `{"status": "rejected", "reason": ...}` on clock-skew rejects; `413`
-  (`{"error": "payload_too_large"}`) on oversized bodies; `400` on invalid JSON or schema.
+  (`{"error": "payload_too_large"}`) on oversized bodies; `400` on invalid JSON or schema;
+  `503` (`{"error": "persist_failed"}`) when the durable write fails.
 
 Side effects:
 - Rejects bodies over `MAX_EVENT_BYTES` (16 KB) with `413` before parsing (checks declared
   `Content-Length` then actual byte length) and increments `events_rejected_too_large`.
+- Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
+  event is crash-safe. A storage error returns `503`, increments `events_persist_failed`, and the
+  event is neither enqueued nor accepted.
 - Increments `events_ingested_total`, reject counters, and `queue_pressure` when the NORMAL
   lane is full.
 - `await event_queue.put(...)` applies backpressure: a full NORMAL lane delays the response;
@@ -100,16 +104,17 @@ Side effects:
 ### `processing.worker_pool.WorkerPool._flush_device_buffer(...)`
 
 Purpose:
-- Enforce per-device timestamp ordering and execute persistence + handler processing.
+- Enforce per-device timestamp ordering and execute handler processing (durability is owned by
+  admission, not the worker).
 
 Behavior:
 1. Wait reorder buffer duration.
 2. Sort buffered events by timestamp.
-3. Persist each event to SQLite `events`.
-4. Invoke resolved handler.
+3. Invoke resolved handler for each event in `ts` order.
 
 Failure behavior:
-- Handler exceptions are logged with context and processing continues.
+- Handler exceptions are logged with context and processing continues; the durable record is
+  unaffected because it was written at admission.
 
 ## Handler Functions
 
@@ -148,7 +153,8 @@ Purpose:
 Side effects:
 - Writes Redis dedup key with TTL.
 - Inserts into SQLite `fall_warnings`.
-- Publishes `AlarmEvent` to `AlarmBus` for streaming.
+- Publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus` for replay/live
+  overlap reconciliation.
 - Updates alarm/dedup/conflict counters.
 
 Failure behavior:
@@ -186,13 +192,27 @@ Purpose:
 - Stream historical (optional `since`) and live alarms via SSE.
 
 Behavior:
-- Replays matching SQLite rows first when `since` provided.
-- Subscribes to room queue and yields live alarms.
+- Subscribes to the room queue before replay begins.
+- Captures the room's durable high-water row ID and replays matching rows through it in bounded
+  `(ts, id)` batches when `since` is provided.
+- Suppresses queued alarms already covered by the replay, then yields newer live alarms.
 - Feed latency is recorded centrally in `AlarmBus._dispatch_room` (at dispatch time), so it is
   measured even when no SSE client is connected; the stream itself only delivers frames.
 
 Failure behavior:
 - On disconnect/cancellation, unsubscribes cleanly in `finally`.
+
+### `api.routes.alarms.get_alarms(...)`
+
+Purpose:
+- Return every persisted alarm matching `since` and optional `room_id` without materializing the
+  full SQLite result set in server memory.
+
+Behavior:
+- Freezes the result at a matching high-water row ID, reads bounded `(ts, id)` keyset batches, and
+  incrementally streams the unchanged `alarms` + `since` JSON response.
+- Concurrently inserted rows remain available to a later request instead of being silently
+  truncated or inconsistently mixed into the current response.
 
 ## Recovery and Snapshots
 

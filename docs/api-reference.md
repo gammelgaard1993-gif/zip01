@@ -19,11 +19,15 @@ Responses:
   16 KB (`MAX_EVENT_BYTES`) limit (counts `events_rejected_too_large`).
 - `400 Bad Request` — `{"error": "invalid_json"}` for non-JSON / non-object bodies.
 - `400 Bad Request` — `{"error": "<reason>"}` for schema failures.
+- `503 Service Unavailable` — `{"error": "persist_failed"}` when the durable write fails; the
+  event is not enqueued or acknowledged (counts `events_persist_failed`).
 
 Behavior:
 - Enforces a 16 KB request size limit (`MAX_EVENT_BYTES`) before validation, checking the
   declared `Content-Length` then the actual body length.
 - Validates via `ingestion.validator.validate_raw_event`.
+- Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
+  event survives a crash. On a storage error the response is `503` and the event is not enqueued.
 - Enqueues to the HIGH lane (`fall_warn`) or the bounded NORMAL lane.
 - Backpressure: a full NORMAL lane delays the response (`await event_queue.put`) rather than
   dropping; HIGH returns immediately under normal/burst load and awaits capacity only when the
@@ -80,7 +84,11 @@ Behavior:
   compared as `ts >= since`. It is validated to be finite and within `0.0 <= since <= now + 1h`
   before use.
 - Optional `room_id` applies an exact room filter.
-- Reads from SQLite `fall_warnings`.
+- Returns the complete matching history in the existing JSON shape while reading SQLite in
+  bounded keyset batches (`ALARM_REPLAY_BATCH_SIZE`, default 500), ordered by `(ts, id)`.
+- Captures a high-water row ID when response streaming begins. Rows inserted afterward are not
+  mixed into that response and remain retrievable on the next request; no hard limit truncates
+  persisted alarms.
 
 ## GET /alarms/stream?room_id=<id>&since=<iso>
 
@@ -90,8 +98,12 @@ Media type:
 - `text/event-stream`
 
 Behavior:
-- If `since` is provided, replays persisted alarms from SQLite first.
-- Subscribes to room queue in alarm bus and streams new alarms.
+- Subscribes to the room queue before replay so alarms published during historical catch-up are
+  buffered rather than missed.
+- If `since` is provided, captures a durable high-water row ID and replays matching SQLite rows
+  through that boundary in bounded `(ts, id)` batches.
+- Suppresses buffered overlap already included in the replay, then streams new alarms. Durable
+  `fall_warning_id` values make the replay/live handoff gap-free without duplicate delivery.
 - Feed latency is observed centrally in the alarm bus at dispatch time (baseline `received_at`),
   so `alarm_feed_latency_ms_p95` is measured even when no stream client is connected; the stream
   itself only delivers frames.

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 from fastapi import Response
 
@@ -15,20 +17,36 @@ from ingestion.queue import PriorityEventQueue
 from models import Priority
 
 
+def _new_events_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL, "
+        "received_at TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    return connection
+
+
 class _FakeRequest:
-    # Minimal stand-in for fastapi.Request: the route only touches .headers, .body() and
-    # .app.state.event_queue, so we avoid a full ASGI/TestClient (and its Redis lifespan).
+    # Minimal stand-in for fastapi.Request: the route only touches .headers, .body(),
+    # .app.state.event_queue and .app.state.db_connection, so we avoid a full ASGI/TestClient
+    # (and its Redis lifespan).
     def __init__(
         self,
         body: bytes,
         event_queue: PriorityEventQueue,
         headers: dict[str, str] | None = None,
+        db_connection: sqlite3.Connection | None = None,
     ) -> None:
         self._body = body
         # None mirrors the route's getattr fallback (no Content-Length available); a dict behaves
         # like fastapi's case-insensitive Headers.get for the keys the route reads.
         self.headers = headers
-        self.app = SimpleNamespace(state=SimpleNamespace(event_queue=event_queue))
+        self.db_connection = db_connection if db_connection is not None else _new_events_db()
+        self.app = SimpleNamespace(
+            state=SimpleNamespace(event_queue=event_queue, db_connection=self.db_connection)
+        )
 
     async def body(self) -> bytes:
         return self._body
@@ -109,6 +127,38 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(result, {"status": "rejected", "reason": "clock_skew_future"})
+        self.assertTrue(queue.empty())
+
+    async def test_valid_event_is_persisted_before_accepted(self) -> None:
+        # Persist-before-ack: an accepted event has a durable `events` row by the time 202 returns,
+        # so a crash after ack cannot lose it. Before the change the durable write happened later
+        # in the worker, so this asserted-on-accept row did not yet exist.
+        queue = PriorityEventQueue(100)
+        db = _new_events_db()
+        request = _FakeRequest(_flat_event("heartbeat"), queue, db_connection=db)
+        response = Response()
+
+        result = await ingest_event(cast(Any, request), response)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(result, {"status": "accepted"})
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+
+    async def test_persist_failure_returns_503_and_not_enqueued(self) -> None:
+        # A storage failure must not falsely accept the event: no 202, no enqueue, so the client
+        # can retry (no false accept, no silent loss).
+        queue = PriorityEventQueue(100)
+        request = _FakeRequest(_flat_event("heartbeat"), queue)
+        response = Response()
+
+        with patch(
+            "api.routes.events.persist_validated_event",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            result = await ingest_event(cast(Any, request), response)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(result, {"error": "persist_failed"})
         self.assertTrue(queue.empty())
 
 

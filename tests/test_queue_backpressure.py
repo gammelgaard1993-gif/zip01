@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 import unittest
@@ -14,6 +15,19 @@ from config import HIGH_QUEUE_MAX_SIZE
 from ingestion.mqtt_subscriber import MQTTSubscriber
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
+
+
+def _events_db() -> sqlite3.Connection:
+    # check_same_thread=False: _enqueue persists on the loop thread while the test drives from
+    # the main thread, sharing this one connection.
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL, "
+        "received_at TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    return connection
 
 
 class QueueBackpressureTests(unittest.IsolatedAsyncioTestCase):
@@ -205,7 +219,7 @@ class SubscriberPriorityInversionTests(unittest.TestCase):
             saturate.result(timeout=1.0)
             self.assertTrue(queue.normal_is_full())
 
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
             subscriber.loop = loop
             client = cast(Any, MagicMock())
 
@@ -286,7 +300,7 @@ class SubscriberConstructionTests(unittest.TestCase):
         queue = PriorityEventQueue(normal_max_size=1)
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
         self.assertIsNotNone(subscriber.client)
 
 
@@ -346,7 +360,7 @@ class NormalManualAckBackpressureTests(unittest.TestCase):
             asyncio.run_coroutine_threadsafe(queue.put(self._normal_event()), loop).result(1.0)
             self.assertTrue(queue.normal_is_full())
 
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
             subscriber.loop = loop
             client = cast(Any, MagicMock())
 

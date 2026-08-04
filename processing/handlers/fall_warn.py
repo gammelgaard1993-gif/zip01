@@ -121,5 +121,6 @@ class FallWarnHandler:
             ts=event.ts,
             confidence=confidence,
             received_at=event.received_at,
+            fall_warning_id=cursor.lastrowid,
         )
         await self.alarm_bus.publish(alarm)

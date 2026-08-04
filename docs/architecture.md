@@ -40,8 +40,10 @@ The primary ingestion path is the `POST /events` route, always active regardless
 Shutdown sequence:
 
 1. Stop the MQTT client loop (if running).
-2. Stop worker/router/flush tasks.
-3. Stop snapshot loop.
+2. Gracefully drain the worker pool: let the router move the global queue into worker lanes and
+   let workers finish buffered flushes, bounded by a timeout (enqueued events are already durable,
+   so anything left at the deadline is replayed on restart).
+3. Stop the snapshot loop and write a final snapshot of the drained hot state.
 4. Close SQLite connection.
 
 ## Component Responsibilities
@@ -55,6 +57,8 @@ Shutdown sequence:
     actual byte length, against `MAX_EVENT_BYTES` (16 KB).
   - Rejects non-JSON / non-object bodies with `400` (counts `events_rejected_invalid_json`).
   - Delegates acceptance rules to the validator.
+  - Persist-before-ack: writes the durable `events` row before the `202`; a storage error returns
+    `503` (`{"error": "persist_failed"}`) and the event is neither enqueued nor accepted.
   - Applies backpressure through the HTTP response: a full NORMAL lane makes `event_queue.put`
     await, delaying the `202` instead of dropping the event. HIGH `fall_warn` returns immediately
     under normal/burst load; only a saturated HIGH lane (`HIGH_QUEUE_MAX_SIZE`) backpressures, and
@@ -88,15 +92,20 @@ Shutdown sequence:
   - Routes each event to a worker by consistent hash of `device_id`
     (`sha256(device_id)` first byte mod `WORKER_COUNT`, default 8), so all of a device's
     events land on one worker.
+  - Each worker owns a bounded two-lane priority queue (`WORKER_NORMAL_QUEUE_MAX_SIZE`): HIGH
+    (`fall_warn`) is drained before NORMAL, so downstream routing preserves priority and cannot
+    grow an unbounded FIFO; a full worker NORMAL lane backpressures the router (and thus ingress).
   - Keeps a per-device reorder buffer that sorts by `ts` before applying handlers.
   - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 100ms).
-  - Persists every event to SQLite before handler execution.
+  - Runs hot-state handlers only; durability is owned by admission (the event is persisted to
+    SQLite before the `202`/MQTT ack), so a handler failure never risks the durable record.
   - Isolates handler failures (logs exception and continues).
 
 - Handlers (`processing/handlers/*`)
   - `HeartbeatHandler`: updates device last heartbeat and heartbeat history in Redis.
   - `PresenceHandler`: updates room occupancy transitions and latest state in Redis.
-  - `FallWarnHandler`: deduplicates, persists alarms to SQLite, publishes to alarm bus.
+  - `FallWarnHandler`: deduplicates, persists alarms to SQLite, and publishes the committed row ID
+    with each alarm so API replay can reconcile durable and live delivery.
   - `GenericEventHandler`: no-op beyond persistence (already done in worker flow); handles
     `motion`, `sleep_state`, `net_status`, and is the fallback for any unmapped event type.
 
@@ -112,8 +121,9 @@ Routes in `api/routes/*`:
 - Event ingestion into the priority queue (`POST /events`)
 - Device health from Redis (`/devices/{device_id}/health`)
 - Room occupancy from Redis transitions (`/rooms/{room_id}/occupancy`)
-- Alarm list from SQLite (`/alarms`)
-- Alarm SSE stream from SQLite replay + alarm bus (`/alarms/stream`)
+- Complete alarm list from bounded SQLite keyset batches (`/alarms`)
+- Gap-free alarm SSE stream using subscribe-first SQLite replay + alarm bus overlap suppression
+  (`/alarms/stream`)
 - Metrics counters, queue depth, and alarm p95 latency (`/metrics`)
 
 ### Recovery

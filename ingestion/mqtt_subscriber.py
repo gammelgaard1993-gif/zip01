@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 from time import perf_counter
+from sqlite3 import Connection
 from typing import Any, cast
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
 from config import MQTT_CLIENT_ID   
+from core.event_log import persist_validated_event
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
 from core.metrics import increment_counter
@@ -19,11 +21,19 @@ logger = logging.getLogger(__name__)
 
 
 class MQTTSubscriber:
-    def __init__(self, broker_url: str, broker_port: int, topic: str, event_queue: PriorityEventQueue) -> None:
+    def __init__(
+        self,
+        broker_url: str,
+        broker_port: int,
+        topic: str,
+        event_queue: PriorityEventQueue,
+        db_connection: Connection,
+    ) -> None:
         self.broker_url = broker_url
         self.broker_port = broker_port
         self.topic = topic
         self.event_queue = event_queue
+        self.db_connection = db_connection
         # VERSION2 callbacks construct cleanly under paho 2.x. manual_ack=True gives QoS-1
         # backpressure without blocking paho's delivery thread: NORMAL pubacks are deferred until
         # the bounded lane accepts (broker throttles on a full inflight window); 
@@ -162,6 +172,9 @@ class MQTTSubscriber:
         future.add_done_callback(lambda _f: client.ack(mid, qos))
 
     async def _enqueue(self, event: ValidatedEvent, was_pressured: bool, submit_perf: float) -> None:
+        # Persist-before-ack: write the durable `events` row on the loop thread (which owns the
+        # SQLite connection) before enqueueing, so an acknowledged MQTT message is already durable.
+        persist_validated_event(self.db_connection, event)
         # On the loop: HIGH returns at once; a full NORMAL lane awaits capacity (delays, never drops).
         await self.event_queue.put(event)
 
