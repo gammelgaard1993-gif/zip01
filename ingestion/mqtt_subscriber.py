@@ -34,6 +34,9 @@ class MQTTSubscriber:
         self.topic = topic
         self.event_queue = event_queue
         self.db_connection = db_connection
+        # Set by the app wiring when a worker pool is present; used to register in-flight events
+        # for the snapshot replay cutoff. Left as None in unit tests that drive _on_message.
+        self.worker_pool: Any = None
         # VERSION2 callbacks construct cleanly under paho 2.x. manual_ack=True gives QoS-1
         # backpressure without blocking paho's delivery thread: NORMAL pubacks are deferred until
         # the bounded lane accepts (broker throttles on a full inflight window); 
@@ -175,6 +178,8 @@ class MQTTSubscriber:
         # Persist-before-ack: write the durable `events` row on the loop thread (which owns the
         # SQLite connection) before enqueueing, so an acknowledged MQTT message is already durable.
         persist_validated_event(self.db_connection, event)
+        if self.worker_pool is not None:
+            self.worker_pool.mark_inflight(event.received_at.isoformat())
         # On the loop: HIGH returns at once; a full NORMAL lane awaits capacity (delays, never drops).
         await self.event_queue.put(event)
 

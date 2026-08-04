@@ -59,6 +59,12 @@ pipelined batch of value reads. The periodic loop stamps `snapshot_ts` first, th
 capture off the event loop (thread executor) so a large keyspace never freezes ingestion or the
 alarm hot path; the SQLite write stays on the loop thread.
 
+`snapshot_ts` is the **replay cutoff**, set to the oldest in-flight event's `received_at` at
+capture time (falling back to `now()` when nothing is in flight), not wall-clock `now()`. This
+closes a race where an event received before the snapshot but still queued/buffered during capture
+would be absent from both the snapshot and the `received_at`-cutoff replay. Because this cutoff is
+non-monotonic, snapshots are selected by insertion `id` (not `snapshot_ts`) on restore.
+
 Captured Redis structures:
 
 - strings
@@ -69,17 +75,21 @@ Captured Redis structures:
 
 `RecoveryManager.restore_state()`:
 
-1. Load latest snapshot by `snapshot_ts DESC`.
+1. Load the newest snapshot by insertion `id` (skipping any malformed/partially-written row).
 2. Clear managed Redis keys.
 3. Reapply snapshot values.
 4. Replay durable events from `events` in `ts ASC` order.
 
 Replay notes:
 
-- Cutoff is on `received_at` (ingestion order), not `ts` (device clock): a snapshot reflects the
-  events ingested before its wall-clock timestamp, so a late event (old `ts`, ingested after the
-  snapshot) is replayed instead of being silently dropped. Rows are still ordered by `ts ASC`.
+- Cutoff is on `received_at` (ingestion order), not `ts` (device clock): a snapshot's `snapshot_ts`
+  is the oldest in-flight event's `received_at` at capture time, so a late event (old `ts`, or one
+  still queued during capture) is replayed instead of being silently dropped. Rows are ordered by
+  `ts ASC`.
 - Boundary is inclusive (`received_at >= snapshot_ts`) to avoid dropping exact-boundary events.
+- A malformed / non-dict snapshot is rejected (never crashes startup and never keeps its cutoff);
+  recovery falls back to a full replay of the durable log, which is correct because every event is
+  persisted at admission.
 - Replay invokes same handlers used in normal flow.
 - Timestamp-aware handlers avoid stale overwrite of newer state.
 - Malformed rows are skipped instead of failing recovery.

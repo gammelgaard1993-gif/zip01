@@ -41,6 +41,29 @@ class WorkerPool:
         self.router_task: asyncio.Task[None] | None = None
         self.flush_tasks: set[asyncio.Task[None]] = set()
         self.reorder_buffer_seconds = DEVICE_REORDER_BUFFER_MS / 1000.0
+        # In-flight received_at multiset: an event is registered at admission (HTTP route / MQTT)
+        # and deregistered once its handler runs. The oldest entry is the snapshot replay cutoff,
+        # so an event still queued/buffered during a snapshot capture is never excluded from
+        # recovery replay.
+        self._inflight_received_at: dict[str, int] = {}
+
+    def mark_inflight(self, received_at_iso: str) -> None:
+        self._inflight_received_at[received_at_iso] = self._inflight_received_at.get(received_at_iso, 0) + 1
+
+    def _mark_done(self, received_at_iso: str) -> None:
+        count = self._inflight_received_at.get(received_at_iso)
+        if count is None:
+            return
+        if count <= 1:
+            self._inflight_received_at.pop(received_at_iso, None)
+        else:
+            self._inflight_received_at[received_at_iso] = count - 1
+
+    def oldest_inflight_received_at(self) -> str | None:
+        # UTC isoformat strings sort lexically in chronological order, so min() is the oldest.
+        if not self._inflight_received_at:
+            return None
+        return min(self._inflight_received_at)
 
     async def start(self) -> None:
         self.workers = [asyncio.create_task(self._worker_loop(index, queue)) for index, queue in enumerate(self.worker_queues)]
@@ -169,6 +192,10 @@ class WorkerPool:
                             "event_ts": next_event.ts.isoformat(),
                         },
                     )
+                finally:
+                    # Deregister from the in-flight watermark once processed (applied or failed);
+                    # the durable record already exists, so this only relaxes the snapshot cutoff.
+                    self._mark_done(next_event.received_at.isoformat())
 
             device_buffers.pop(device_id, None)
         finally:

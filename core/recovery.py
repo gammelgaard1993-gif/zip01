@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import logging
 from time import perf_counter
 from sqlite3 import Connection
-from typing import Any, Iterable, Protocol, TypedDict, cast
+from typing import Any, Callable, Iterable, Protocol, TypedDict, cast
 
 from config import STATE_SNAPSHOT_INTERVAL_SECONDS
 from ingestion.validator import ValidationError
@@ -94,10 +94,20 @@ def _as_text(value: str | bytes | bytearray | memoryview | None) -> str:
 
 
 class RecoveryManager:
-    def __init__(self, db_connection: Connection, redis_client: Redis, alarm_bus: AlarmBus) -> None:
+    def __init__(
+        self,
+        db_connection: Connection,
+        redis_client: Redis,
+        alarm_bus: AlarmBus,
+        inflight_watermark_provider: Callable[[], str | None] | None = None,
+    ) -> None:
         self.db_connection: Connection = db_connection
         self.redis: Redis = redis_client
         self.alarm_bus: AlarmBus = alarm_bus
+        # Returns the oldest in-flight event's received_at (or None). Used as the snapshot replay
+        # cutoff so an event received before the snapshot but still queued/buffered during capture
+        # is never excluded from recovery replay.
+        self._inflight_watermark_provider = inflight_watermark_provider
         self._snapshot_task: asyncio.Task[None] | None = None
 
     async def restore_state(self) -> None:
@@ -158,14 +168,23 @@ class RecoveryManager:
             # are still O(N) work and must not freeze ingestion or the alarm hot path. The Redis
             # client is thread-safe, but the SQLite write stays on the loop thread so the shared
             # connection is never used by two threads at once.
-            snapshot_ts = datetime.now(timezone.utc).isoformat()
+            snapshot_ts = self._current_snapshot_ts()
             state_json = await loop.run_in_executor(None, self._capture_state_json)
             self._persist_snapshot(snapshot_ts, state_json)
 
     def write_snapshot(self) -> None:
         # Synchronous, on-demand snapshot (e.g. graceful shutdown); the periodic path is _snapshot_loop.
-        snapshot_ts = datetime.now(timezone.utc).isoformat()
-        self._persist_snapshot(snapshot_ts, self._capture_state_json())
+        self._persist_snapshot(self._current_snapshot_ts(), self._capture_state_json())
+
+    def _current_snapshot_ts(self) -> str:
+        # Replay cutoff = oldest in-flight event's received_at (falling back to now when nothing is
+        # in flight), so replay (received_at >= snapshot_ts) always re-covers every not-yet-applied
+        # event. This can go backwards over time, so snapshots are ordered by id (not snapshot_ts)
+        # when choosing the newest on restore.
+        watermark = (
+            self._inflight_watermark_provider() if self._inflight_watermark_provider is not None else None
+        )
+        return watermark or datetime.now(timezone.utc).isoformat()
 
     def _capture_state_json(self) -> str:
         return json.dumps(self._capture_state())
@@ -230,7 +249,7 @@ class RecoveryManager:
     def _load_latest_snapshot(self) -> tuple[str | None, SnapshotState | None]:
         cursor = self.db_connection.cursor()
         cursor.execute(
-            "SELECT snapshot_ts, state_json FROM state_snapshots ORDER BY snapshot_ts DESC LIMIT 1"
+            "SELECT snapshot_ts, state_json FROM state_snapshots ORDER BY id DESC LIMIT 1"
         )
         row = cursor.fetchone()
         if row is None:
@@ -238,11 +257,20 @@ class RecoveryManager:
         snapshot_ts_raw, state_json_raw = row
         snapshot_ts = _as_text(cast(str | bytes | bytearray | memoryview, snapshot_ts_raw))
         state_json = _as_text(cast(str | bytes | bytearray | memoryview, state_json_raw))
-        # A malformed / non-dict snapshot normalizes to state=None so recovery falls back to pure
-        # replay instead of crashing on a partially written row.
-        parsed = json.loads(state_json)
+        # A malformed / partially-written snapshot must not crash startup or keep its cutoff: fall
+        # back to full replay (correct because every event is durable at admission).
+        try:
+            parsed = json.loads(state_json)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                json.dumps({"event": "snapshot_rejected", "reason": "invalid_json", "snapshot_ts": snapshot_ts})
+            )
+            return None, None
         if not isinstance(parsed, dict):
-            return snapshot_ts, None
+            logger.warning(
+                json.dumps({"event": "snapshot_rejected", "reason": "not_a_dict", "snapshot_ts": snapshot_ts})
+            )
+            return None, None
         parsed_obj = cast(dict[str, object], parsed)
         strings_raw = parsed_obj.get("strings", {})
         hashes_raw = parsed_obj.get("hashes", {})

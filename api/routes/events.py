@@ -115,6 +115,12 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
         response.status_code = 503
         return {"error": "persist_failed"}
 
+    # Register the event as in-flight (admission -> applied) so a snapshot taken while it is still
+    # queued/buffered uses a replay cutoff old enough to re-cover it on recovery.
+    worker_pool = getattr(request.app.state, "worker_pool", None)
+    if worker_pool is not None:
+        worker_pool.mark_inflight(validated.received_at.isoformat())
+
     # 4) Enqueue for hot-state processing. HIGH returns immediately; a full NORMAL lane awaits
     #    capacity (backpressure: the HTTP response is delayed, the event is never dropped).
     event_queue: PriorityEventQueue = request.app.state.event_queue

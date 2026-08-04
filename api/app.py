@@ -44,11 +44,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             event_queue=app.state.event_queue,
             db_connection=app.state.db_connection,
         )
+        app.state.mqtt_subscriber.worker_pool = app.state.worker_pool
 
     recovery_manager = RecoveryManager(
         db_connection=app.state.db_connection,
         redis_client=app.state.redis_client,
         alarm_bus=app.state.alarm_bus,
+        inflight_watermark_provider=app.state.worker_pool.oldest_inflight_received_at,
     )
     app.state.recovery_manager = recovery_manager
     await recovery_manager.restore_state()

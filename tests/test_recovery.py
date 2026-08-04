@@ -365,6 +365,99 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
             sorted(ts.isoformat() for ts in (earliest, middle, latest)),
         )
 
+    async def test_snapshot_ts_uses_oldest_inflight_received_at(self) -> None:
+        # Finding #5: the snapshot replay cutoff must be the oldest in-flight event's received_at,
+        # not wall-clock now(). An event received before the snapshot but still queued/buffered at
+        # capture time would otherwise be excluded from replay (received_at < now) and lost. With
+        # the in-flight watermark, the cutoff is old enough to re-cover it.
+        fake_redis = CaptureFakeRedis()
+        oldest_inflight = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: oldest_inflight,
+        )
+
+        manager.write_snapshot()
+
+        stored_ts = self.db.execute(
+            "SELECT snapshot_ts FROM state_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        self.assertEqual(stored_ts, oldest_inflight)
+
+    async def test_snapshot_ts_falls_back_to_now_when_nothing_inflight(self) -> None:
+        # With nothing in flight the provider returns None, so the cutoff falls back to now().
+        fake_redis = CaptureFakeRedis()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: None,
+        )
+
+        before = datetime.now(timezone.utc)
+        manager.write_snapshot()
+        after = datetime.now(timezone.utc)
+
+        stored_ts = self.db.execute(
+            "SELECT snapshot_ts FROM state_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        stamped = datetime.fromisoformat(stored_ts)
+        self.assertGreaterEqual(stamped, before)
+        self.assertLessEqual(stamped, after)
+
+    async def test_malformed_snapshot_falls_back_to_full_replay(self) -> None:
+        # Finding #6: a corrupt (unparseable) or non-dict snapshot must not crash startup and must
+        # not keep its cutoff; recovery loads it as (None, None) so restore does a full replay.
+        fake_redis = FakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", "{ this is not valid json"),
+        )
+        self.db.commit()
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertIsNone(snapshot_ts)
+        self.assertIsNone(state)
+
+        # A JSON scalar (valid JSON, wrong shape) is also rejected to full replay.
+        self.db.execute("DELETE FROM state_snapshots")
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", json.dumps("not-a-dict")),
+        )
+        self.db.commit()
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertIsNone(snapshot_ts)
+        self.assertIsNone(state)
+
+    async def test_newest_snapshot_chosen_by_id_not_ts(self) -> None:
+        # Because snapshot_ts now holds the (non-monotonic) replay cutoff, the newest snapshot is
+        # chosen by insertion id, not by snapshot_ts. Insert an older-cutoff snapshot AFTER a
+        # newer-cutoff one and confirm the last-inserted row wins.
+        fake_redis = FakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        first_state: SnapshotState = {"strings": {"device:a:last_heartbeat": "t"}, "hashes": {}, "zsets": {}}
+        second_state: SnapshotState = {"strings": {"device:b:last_heartbeat": "t"}, "hashes": {}, "zsets": {}}
+        # First insert has a LATER cutoff ts; second (newer by id) has an EARLIER cutoff ts.
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:05+00:00", json.dumps(first_state)),
+        )
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", json.dumps(second_state)),
+        )
+        self.db.commit()
+
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertEqual(snapshot_ts, "2026-06-29T12:00:00+00:00")
+        assert state is not None
+        self.assertIn("device:b:last_heartbeat", state["strings"])
+
 
 if __name__ == "__main__":
     unittest.main()

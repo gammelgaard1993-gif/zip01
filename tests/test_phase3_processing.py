@@ -210,6 +210,26 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("dev_drain", applied)
 
+    async def test_inflight_watermark_registers_and_clears_after_handling(self) -> None:
+        # #5 support: an event registered as in-flight at admission is the snapshot cutoff until its
+        # handler runs, then it is deregistered (watermark returns to None when idle).
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            return None
+
+        queue = PriorityEventQueue(10)
+        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+        event = self._event("motion", device_id="dev_wm")
+        pool.mark_inflight(event.received_at.isoformat())
+        self.assertEqual(pool.oldest_inflight_received_at(), event.received_at.isoformat())
+
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await queue.put(event)
+            await asyncio.sleep(0.4)
+            await pool.stop()
+
+        self.assertIsNone(pool.oldest_inflight_received_at())
+
     async def test_worker_pool_error_isolation_continues_processing(self) -> None:
         queue = PriorityEventQueue(20)
         pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
