@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from concurrent.futures import Executor
 from sqlite3 import Connection
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
 
 from config import DEVICE_REORDER_BUFFER_MS, WORKER_COUNT, WORKER_NORMAL_QUEUE_MAX_SIZE
 from ingestion.queue import PriorityEventQueue
@@ -17,6 +18,9 @@ from processing.handlers.fall_warn import FallWarnHandler
 from processing.alarm_bus import AlarmBus
 from redis import Redis
 
+if TYPE_CHECKING:
+    from core.db_writer import BatchedSQLiteWriter
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,11 +31,18 @@ class WorkerPool:
         alarm_bus: AlarmBus,
         db_connection: Connection,
         redis_client: Redis,
+        redis_executor: Executor | None = None,
+        sqlite_writer: "BatchedSQLiteWriter | None" = None,
     ) -> None:
         self.event_queue: PriorityEventQueue = event_queue
         self.alarm_bus: AlarmBus = alarm_bus
         self.db_connection: Connection = db_connection
         self.redis_client: Redis = redis_client
+        # Optional Phase 6 (#13) offload dependencies: a shared thread pool for synchronous
+        # redis-py calls and a dedicated single-writer thread for SQLite writes. Both default to
+        # None, in which case handlers run exactly as before (synchronous, on the worker task).
+        self.redis_executor = redis_executor
+        self.sqlite_writer = sqlite_writer
         # Each worker owns a bounded two-lane priority queue: HIGH (fall_warn) is drained before
         # NORMAL, so downstream routing preserves priority and can never grow an unbounded FIFO.
         self.worker_queues: List[PriorityEventQueue] = [
@@ -118,9 +129,15 @@ class WorkerPool:
         device_buffers: Dict[str, List[ValidatedEvent]] = {}
         flush_tasks: Dict[str, asyncio.Task[None]] = {}
         handlers: dict[str, EventHandler] = {
-            "heartbeat": HeartbeatHandler(self.redis_client),
-            "presence": PresenceHandler(self.redis_client),
-            "fall_warn": FallWarnHandler(self.redis_client, self.db_connection, self.alarm_bus),
+            "heartbeat": HeartbeatHandler(self.redis_client, executor=self.redis_executor),
+            "presence": PresenceHandler(self.redis_client, executor=self.redis_executor),
+            "fall_warn": FallWarnHandler(
+                self.redis_client,
+                self.db_connection,
+                self.alarm_bus,
+                writer=self.sqlite_writer,
+                executor=self.redis_executor,
+            ),
             "motion": GenericEventHandler(self.db_connection),
             "sleep_state": GenericEventHandler(self.db_connection),
             "net_status": GenericEventHandler(self.db_connection),

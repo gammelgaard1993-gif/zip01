@@ -1,18 +1,16 @@
 # Teton backend — developer & grader entrypoints.
 #
 # `make run` is the single command that brings up Mosquitto + Redis (via Docker)
-# and starts the service. The other targets drive the simulator / test suite.
+# and starts the service. The other targets drive the event generator / test suite.
 #
 # Windows note: `make`/`docker` may not be installed. Equivalent PowerShell
 # commands are documented in README.md ("Running on Windows").
 
 PYTHON   ?= python3
-HOST     ?= localhost
-MQTT_PORT?= 1883
 API      ?= http://localhost:8080
 DEVICES  ?= 500
 DURATION ?= 30
-RATE     ?= 50000
+RPS      ?= 1.0
 COMPOSE  ?= docker compose
 
 .DEFAULT_GOAL := help
@@ -50,20 +48,27 @@ test: ## Run the unit + integration test suite
 
 .PHONY: smoke
 smoke: ## Quick end-to-end check (service must be running)
-	$(PYTHON) tools/simulator.py steady --host $(HOST) --port $(MQTT_PORT) --devices 50 --duration 5 --rate 1
+	$(PYTHON) event_generator/generate.py --mode baseline --target $(API) --devices 50 --duration 5 --rps-per-device 1.0
 	@sleep 2
 	@echo "--- /metrics ---";              curl -s $(API)/metrics
 	@echo "\n--- /devices/dev_0001/health ---"; curl -s $(API)/devices/dev_0001/health
-	@echo "\n--- /rooms/room_00/occupancy?window=1m ---"; curl -s "$(API)/rooms/room_00/occupancy?window=1m"
+	@echo "\n--- /rooms/room_000/occupancy?window=1m ---"; curl -s "$(API)/rooms/room_000/occupancy?window=1m"
 
 .PHONY: burst
-burst: ## 10x burst load — verify no drops + alarm p95 <= 1s (service must be running)
-	$(PYTHON) tools/simulator.py burst --host $(HOST) --port $(MQTT_PORT) --devices $(DEVICES) --duration $(DURATION) --rate $(RATE)
+burst: ## Burst load (two 10x/30s spikes) — verify no drops + alarm p95 <= 1s (service must be running)
+	$(PYTHON) event_generator/generate.py --mode burst --target $(API) --devices $(DEVICES) --duration $(DURATION) --rps-per-device $(RPS)
 	@sleep 2
 	@echo "--- /metrics (check fall p95 + queue depths) ---"; curl -s $(API)/metrics
 
 .PHONY: offline
-offline: ## Offline device replays a backlog of late events (service must be running)
-	$(PYTHON) tools/simulator.py offline --host $(HOST) --port $(MQTT_PORT) --offline-minutes 20 --events 1200
+offline: ## 20% of devices go offline then replay a backlog of late events (service must be running)
+	$(PYTHON) event_generator/generate.py --mode offline --target $(API) --devices $(DEVICES) --duration 120 --rps-per-device $(RPS)
 	@sleep 2
-	@echo "--- /rooms/room_00/occupancy?window=1h (backfilled) ---"; curl -s "$(API)/rooms/room_00/occupancy?window=1h"
+	@echo "--- /rooms/room_000/occupancy?window=1h (backfilled) ---"; curl -s "$(API)/rooms/room_000/occupancy?window=1h"
+
+.PHONY: adversarial
+adversarial: ## Burst + offline + clock skew combined — full stress scenario (service must be running)
+	$(PYTHON) event_generator/generate.py --mode adversarial --target $(API) --devices $(DEVICES) --duration 120 --rps-per-device $(RPS)
+	@sleep 2
+	@echo "--- /metrics ---"; curl -s $(API)/metrics
+

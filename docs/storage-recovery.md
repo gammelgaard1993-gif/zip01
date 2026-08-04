@@ -13,6 +13,7 @@ Managed key families:
 - `dedup:{sha256(...)}` (fall dedup key with TTL)
 
 Primary purpose:
+
 - Fast read-path state for health and occupancy APIs.
 - Short-term dedup and live alarm fan-out support.
 

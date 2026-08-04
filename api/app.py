@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import logging
-from typing import AsyncIterator
+from typing import AsyncGenerator
 
 from fastapi import FastAPI
 
@@ -15,13 +16,21 @@ from ingestion.queue import PriorityEventQueue
 from ingestion.mqtt_subscriber import MQTTSubscriber
 from processing.alarm_bus import AlarmBus
 from processing.worker_pool import WorkerPool
+from core.db_writer import BatchedSQLiteWriter
 from core.recovery import RecoveryManager
-from config import NORMAL_QUEUE_MAX_SIZE, ENABLE_MQTT, MQTT_BROKER_URL, MQTT_BROKER_PORT, MQTT_TOPIC
+from config import (
+    NORMAL_QUEUE_MAX_SIZE,
+    ENABLE_MQTT,
+    MQTT_BROKER_URL,
+    MQTT_BROKER_PORT,
+    MQTT_TOPIC,
+    REDIS_EXECUTOR_MAX_WORKERS,
+)
 
 logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from core.db import init_db
     from core.redis_client import get_redis_client
 
@@ -29,11 +38,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis_client = get_redis_client()
     app.state.alarm_bus = AlarmBus()
     app.state.event_queue = PriorityEventQueue(NORMAL_QUEUE_MAX_SIZE)
+
+    # Phase 6 (#13): a dedicated single-writer thread (own SQLite connection) batches durable
+    # writes off the loop, and a shared thread pool offloads the synchronous redis-py calls made
+    # by handlers, the health route, and periodic snapshot capture.
+    app.state.sqlite_writer = BatchedSQLiteWriter()
+    app.state.sqlite_writer.start()
+    app.state.redis_executor = ThreadPoolExecutor(
+        max_workers=REDIS_EXECUTOR_MAX_WORKERS, thread_name_prefix="redis-io"
+    )
+
     app.state.worker_pool = WorkerPool(
         event_queue=app.state.event_queue,
         alarm_bus=app.state.alarm_bus,
         db_connection=app.state.db_connection,
         redis_client=app.state.redis_client,
+        redis_executor=app.state.redis_executor,
+        sqlite_writer=app.state.sqlite_writer,
     )
     app.state.mqtt_subscriber = None
     if ENABLE_MQTT:
@@ -45,12 +66,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             db_connection=app.state.db_connection,
         )
         app.state.mqtt_subscriber.worker_pool = app.state.worker_pool
+        app.state.mqtt_subscriber.sqlite_writer = app.state.sqlite_writer
 
     recovery_manager = RecoveryManager(
         db_connection=app.state.db_connection,
         redis_client=app.state.redis_client,
         alarm_bus=app.state.alarm_bus,
         inflight_watermark_provider=app.state.worker_pool.oldest_inflight_received_at,
+        redis_executor=app.state.redis_executor,
     )
     app.state.recovery_manager = recovery_manager
     await recovery_manager.restore_state()
@@ -81,9 +104,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception:
                 logging.exception("final snapshot on shutdown failed")
 
+        # Stop the writer/executor after all handler and route work has drained above, and before
+        # closing the shared connection they may still reference mid-flight.
+        sqlite_writer = getattr(app.state, "sqlite_writer", None)
+        if sqlite_writer is not None:
+            sqlite_writer.stop()
+
+        redis_executor = getattr(app.state, "redis_executor", None)
+        if redis_executor is not None:
+            redis_executor.shutdown(wait=True)
+
         db_connection = getattr(app.state, "db_connection", None)
         if db_connection is not None:
             db_connection.close()
+
 
 
 app = FastAPI(title="Teton Backend", lifespan=lifespan)

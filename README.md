@@ -30,9 +30,9 @@ then run the service and simulator directly:
 ```powershell
 python -m pip install -r requirements.txt
 python main.py                                              # service on :8080
-python tools/simulator.py steady  --devices 500 --duration 30          # baseline
-python tools/simulator.py burst   --devices 500 --duration 30 --rate 50000
-python tools/simulator.py offline --offline-minutes 20 --events 1200
+python event_generator/generate.py --mode baseline --duration 30 --devices 500 --target http://localhost:8080
+python event_generator/generate.py --mode burst     --duration 30 --devices 500 --target http://localhost:8080
+python event_generator/generate.py --mode offline   --duration 120 --devices 500 --target http://localhost:8080
 python -m unittest discover -s tests -v                    # tests
 ```
 

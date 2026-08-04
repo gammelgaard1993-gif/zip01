@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 from typing import Protocol, cast
 
@@ -45,10 +47,21 @@ def _as_text(value: str | bytes | bytearray | memoryview) -> str:
 
 
 class HeartbeatHandler:
-    def __init__(self, redis_client: Redis) -> None:
+    def __init__(self, redis_client: Redis, executor: Executor | None = None) -> None:
         self.redis = redis_client
+        # Optional shared thread pool: when present, the synchronous redis-py calls below run on
+        # a background thread instead of the event loop (Phase 6 / #13). Left None for recovery
+        # replay and tests, which run the same code synchronously with no behavior change.
+        self._executor = executor
 
     async def handle(self, event: ValidatedEvent) -> None:
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._apply, event)
+        else:
+            self._apply(event)
+
+    def _apply(self, event: ValidatedEvent) -> None:
         key_last = f"device:{event.device_id}:last_heartbeat"
         key_set = f"device:{event.device_id}:heartbeats"
         ts_score = event.ts.timestamp()

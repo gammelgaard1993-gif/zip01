@@ -58,3 +58,16 @@ MAX_EVENT_BYTES = 16_384
 STATE_SNAPSHOT_INTERVAL_SECONDS = 60
 
 FALL_DEDUP_TTL_SECONDS = 10
+
+# Dedicated single-writer-thread SQLite batching (Phase 6 / #13): amortizes the commit/fsync cost
+# of persist-before-ack across many events instead of paying it per-event. Kept small so batching
+# never taxes the alarm p95<=1s SLO; priority (fall_warn) writes skip the wait entirely (see
+# core/db_writer.py).
+SQLITE_WRITER_BATCH_WINDOW_SECONDS = 0.005
+SQLITE_WRITER_MAX_BATCH_SIZE = 200
+
+# Shared thread pool for offloading synchronous redis-py calls (handlers + recovery snapshot
+# capture) off the event loop. Local Redis round trips are sub-millisecond, so this comfortably
+# covers the 5k sustained / 50k burst target without the loop ever blocking on I/O.
+REDIS_EXECUTOR_MAX_WORKERS = 32
+

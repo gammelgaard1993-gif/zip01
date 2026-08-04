@@ -8,6 +8,7 @@ on `:8080` by default (`config.py`, overridable via the `PORT` env var).
 Source: `api/routes/events.py` (primary ingestion transport)
 
 Body:
+
 - One flat JSON event: `device_id`, `room_id`, `type`, `ts` (ISO 8601), optional `seq`, plus the
   required type-specific field: `in_room` (bool, presence), `magnitude` (finite number, motion),
   `state` (non-empty string, sleep_state), `confidence` (finite number in `[0, 1]`, fall_warn),
@@ -15,6 +16,7 @@ Body:
   documented values.
 
 Responses:
+
 - `202 Accepted` — `{"status": "accepted"}` once validated and enqueued.
 - `202 Accepted` — `{"status": "rejected", "reason": "clock_skew_future|clock_skew_past"}` when
   the timestamp is outside +/-1 hour (received but not enqueued).
@@ -26,6 +28,7 @@ Responses:
   event is not enqueued or acknowledged (counts `events_persist_failed`).
 
 Behavior:
+
 - Enforces a 16 KB request size limit (`MAX_EVENT_BYTES`) before validation: checks the declared
   `Content-Length` header as a fast path, then reads the body incrementally and aborts with `413`
   as soon as the running total exceeds the cap, so an oversized body (including one with a
@@ -44,11 +47,13 @@ Behavior:
 Source: `api/routes/health.py`
 
 Returns:
+
 - `device_id`
 - `last_heartbeat_ts` (ISO timestamp string)
 - `availability_5m` (0.0 to 1.0)
 
 Behavior:
+
 - Reads `device:{id}:last_heartbeat` from Redis.
 - Computes availability from the heartbeat zset count over the 5-minute window
   (`count / 300`, clamped to 1.0).
@@ -59,11 +64,13 @@ Behavior:
 Source: `api/routes/occupancy.py`
 
 Returns:
+
 - `in_room` (bool) — latest presence state from the `room:{id}:presence` hash.
 - `occupied_pct` (0.0 to 1.0) — fraction of the window the room was occupied.
 - `window_seconds` (int) — the resolved window length in seconds.
 
 Behavior:
+
 - `window` accepts `Nm` (minutes), `Nh` (hours), or bare `N` (seconds); default `5m`. Invalid or
   non-positive windows return `400`.
 - Reads the transition zset within the requested duration.
@@ -76,15 +83,18 @@ Behavior:
 Source: `api/routes/alarms.py`
 
 Returns:
+
 - `alarms`: list of persisted fall warnings (`device_id`, `room_id`, `ts`, `confidence`,
   `received_at`), ordered by `ts ASC`.
 - `since`: the epoch value echoed back.
 
 Responses:
+
 - `400 Bad Request` — `{"detail": "invalid since"}` when `since` is NaN, infinite, negative, or
   out of range (greater than now + 1 hour, or otherwise unrepresentable as a timestamp).
 
 Behavior:
+
 - `since` is a float Unix epoch (default `0.0` = full history), converted to a UTC ISO string and
   compared as `ts >= since`. It is validated to be finite and within `0.0 <= since <= now + 1h`
   before use.
@@ -100,9 +110,11 @@ Behavior:
 Source: `api/routes/alarms.py`
 
 Media type:
+
 - `text/event-stream`
 
 Behavior:
+
 - Subscribes to the room queue before replay so alarms published during historical catch-up are
   buffered rather than missed.
 - If `since` is provided, captures a durable high-water row ID and replays matching SQLite rows
@@ -123,6 +135,7 @@ Behavior:
 Source: `api/routes/metrics.py`
 
 Returns a `counters` object with runtime metrics, including:
+
 - Ingestion: `events_ingested_total`, `events_late`
 - Rejections: `events_rejected_too_large`, `events_rejected_invalid_json`,
   `events_rejected_invalid_schema`, `events_rejected_clock_skew`,

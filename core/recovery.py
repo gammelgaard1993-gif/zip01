@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 import logging
 from time import perf_counter
@@ -100,6 +101,7 @@ class RecoveryManager:
         redis_client: Redis,
         alarm_bus: AlarmBus,
         inflight_watermark_provider: Callable[[], str | None] | None = None,
+        redis_executor: Executor | None = None,
     ) -> None:
         self.db_connection: Connection = db_connection
         self.redis: Redis = redis_client
@@ -108,6 +110,11 @@ class RecoveryManager:
         # cutoff so an event received before the snapshot but still queued/buffered during capture
         # is never excluded from recovery replay.
         self._inflight_watermark_provider = inflight_watermark_provider
+        # Optional shared thread pool (Phase 6 / #13): when present, the periodic snapshot
+        # capture's blocking SCAN + pipelined reads consolidate onto the SAME pool used for
+        # handler redis offload instead of asyncio's default executor, avoiding two independently
+        # sized pools contending under load. Falls back to the default executor when None.
+        self._redis_executor = redis_executor
         self._snapshot_task: asyncio.Task[None] | None = None
 
     async def restore_state(self) -> None:
@@ -169,7 +176,7 @@ class RecoveryManager:
             # client is thread-safe, but the SQLite write stays on the loop thread so the shared
             # connection is never used by two threads at once.
             snapshot_ts = self._current_snapshot_ts()
-            state_json = await loop.run_in_executor(None, self._capture_state_json)
+            state_json = await loop.run_in_executor(self._redis_executor, self._capture_state_json)
             self._persist_snapshot(snapshot_ts, state_json)
 
     def write_snapshot(self) -> None:

@@ -12,7 +12,7 @@ import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
 from config import MQTT_CLIENT_ID   
-from core.event_log import persist_validated_event
+from core.event_log import persist_validated_event, persist_validated_event_async
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
 from core.metrics import increment_counter
@@ -38,6 +38,9 @@ class MQTTSubscriber:
         # Set by the app wiring when a worker pool is present; used to register in-flight events
         # for the snapshot replay cutoff. Left as None in unit tests that drive _on_message.
         self.worker_pool: Any = None
+        # Set by the app wiring when the dedicated batched SQLite writer is present. Left as None
+        # in unit tests, which fall back to a direct synchronous write.
+        self.sqlite_writer: Any = None
         # VERSION2 callbacks construct cleanly under paho 2.x. manual_ack=True gives QoS-1
         # backpressure without blocking paho's delivery thread: every ack is deferred until the
         # underlying persist+enqueue actually succeeds (see _on_message), so acking never races
@@ -69,7 +72,7 @@ class MQTTSubscriber:
         try:
             raw_payload = json.loads(msg.payload.decode("utf-8"))
         except UnicodeDecodeError:
-            # Permanently malformed (not valid UTF-8) — redelivery can't fix this, so ack and drop
+            # Permanently malformed (not valid UTF-8) — redelivery can't fix this, so ack and drop 
             # it now rather than leaving it stuck in the broker's inflight window forever.
             increment_counter("events_rejected_invalid_json")
             logger.warning(
@@ -209,9 +212,13 @@ class MQTTSubscriber:
         future.add_done_callback(_on_enqueue_done)
 
     async def _enqueue(self, event: ValidatedEvent, was_pressured: bool, submit_perf: float) -> None:
-        # Persist-before-ack: write the durable `events` row on the loop thread (which owns the
-        # SQLite connection) before enqueueing, so an acknowledged MQTT message is already durable.
-        persist_validated_event(self.db_connection, event)
+        # Persist-before-ack: write the durable `events` row before enqueueing, so an acknowledged
+        # MQTT message is already durable. Routes through the dedicated batched writer when
+        # present (keeps the loop unblocked); falls back to a direct synchronous write otherwise.
+        if self.sqlite_writer is not None:
+            await persist_validated_event_async(self.sqlite_writer, event)
+        else:
+            persist_validated_event(self.db_connection, event)
         if self.worker_pool is not None:
             self.worker_pool.mark_inflight(event.received_at.isoformat())
         # On the loop: HIGH returns at once; a full NORMAL lane awaits capacity (delays, never drops).

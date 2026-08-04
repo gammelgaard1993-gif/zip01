@@ -8,7 +8,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Request, Response
 
 import config
-from core.event_log import persist_validated_event
+from core.event_log import persist_validated_event, persist_validated_event_async
 from core.metrics import increment_counter
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
@@ -106,10 +106,16 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
     # 3) Persist-before-ack: write the durable `events` row BEFORE returning 202, so an accepted
     #    event survives a crash even though its hot-state handler runs later. On a storage error
     #    the event is NOT acknowledged (503) and NOT enqueued, so the client can retry (no false
-    #    accept, no silent loss).
+    #    accept, no silent loss). Routes through the dedicated batched writer when present (keeps
+    #    the loop unblocked); falls back to a direct synchronous write otherwise (unit tests /
+    #    any deployment that hasn't wired one up).
     db_connection: sqlite3.Connection = request.app.state.db_connection
+    sqlite_writer = getattr(request.app.state, "sqlite_writer", None)
     try:
-        persist_validated_event(db_connection, validated)
+        if sqlite_writer is not None:
+            await persist_validated_event_async(sqlite_writer, validated)
+        else:
+            persist_validated_event(db_connection, validated)
     except sqlite3.Error:
         increment_counter("events_persist_failed")
         logger.error(
