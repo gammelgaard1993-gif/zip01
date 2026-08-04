@@ -8,8 +8,11 @@ on `:8080` by default (`config.py`, overridable via the `PORT` env var).
 Source: `api/routes/events.py` (primary ingestion transport)
 
 Body:
-- One flat JSON event: `device_id`, `room_id`, `type`, `ts` (ISO 8601), optional `seq`, plus any
-  type-specific fields (`in_room`, `magnitude`, `state`, `confidence`, `rssi`).
+- One flat JSON event: `device_id`, `room_id`, `type`, `ts` (ISO 8601), optional `seq`, plus the
+  required type-specific field: `in_room` (bool, presence), `magnitude` (finite number, motion),
+  `state` (non-empty string, sleep_state), `confidence` (finite number in `[0, 1]`, fall_warn),
+  `rssi` (finite number, net_status); `heartbeat` carries none. `type` must be one of these 6
+  documented values.
 
 Responses:
 - `202 Accepted` — `{"status": "accepted"}` once validated and enqueued.
@@ -23,8 +26,10 @@ Responses:
   event is not enqueued or acknowledged (counts `events_persist_failed`).
 
 Behavior:
-- Enforces a 16 KB request size limit (`MAX_EVENT_BYTES`) before validation, checking the
-  declared `Content-Length` then the actual body length.
+- Enforces a 16 KB request size limit (`MAX_EVENT_BYTES`) before validation: checks the declared
+  `Content-Length` header as a fast path, then reads the body incrementally and aborts with `413`
+  as soon as the running total exceeds the cap, so an oversized body (including one with a
+  missing/lying `Content-Length` or chunked transfer-encoding) is never fully buffered in memory.
 - Validates via `ingestion.validator.validate_raw_event`.
 - Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
   event survives a crash. On a storage error the response is `503` and the event is not enqueued.
@@ -108,6 +113,10 @@ Behavior:
   so `alarm_feed_latency_ms_p95` is measured even when no stream client is connected; the stream
   itself only delivers frames.
 - Unsubscribes subscriber queue on stream termination.
+- Each subscriber's queue is bounded (`SSE_SUBSCRIBER_QUEUE_MAX_SIZE`). A stalled/slow client that
+  doesn't drain fast enough is evicted (counts `sse_subscribers_evicted`) rather than blocking
+  delivery to other subscribers in the room; once its queue is drained the connection closes, and
+  the client must reconnect with `since=<last seen ts>` to resume without a gap.
 
 ## GET /metrics
 

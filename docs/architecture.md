@@ -97,6 +97,10 @@ Shutdown sequence:
     grow an unbounded FIFO; a full worker NORMAL lane backpressures the router (and thus ingress).
   - Keeps a per-device reorder buffer that sorts by `ts` before applying handlers.
   - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 100ms).
+  - Ordering guarantee is bounded to that window: an event arriving after its device's buffer
+    already flushed is applied out of `ts` order relative to already-handled events (never
+    dropped). Correctness of derived state is preserved by ts-aware, idempotent handlers rather
+    than by strict apply order (see `tests/test_ordering.py`).
   - Runs hot-state handlers only; durability is owned by admission (the event is persisted to
     SQLite before the `202`/MQTT ack), so a handler failure never risks the durable record.
   - Isolates handler failures (logs exception and continues).

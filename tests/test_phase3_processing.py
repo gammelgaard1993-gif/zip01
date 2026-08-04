@@ -277,6 +277,15 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.get("in_room"), "true")
         self.assertEqual(state.get("ts"), now.isoformat())
 
+    async def test_presence_handler_rejects_non_bool_in_room(self) -> None:
+        # Defense in depth for data that bypasses ingestion-time validation (e.g. recovery replay
+        # of a pre-existing row): bool("false") is True, so a string must raise, not coerce.
+        redis_client = FakeRedis()
+        handler = PresenceHandler(redis_client)  # type: ignore[arg-type]
+
+        with self.assertRaises(TypeError):
+            await handler.handle(self._event("presence", payload={"in_room": "false"}))
+
     async def test_fall_warn_handler_dedups_persists_and_publishes(self) -> None:
         redis_client = FakeRedis()
         alarm_bus = FakeAlarmBus()

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 import config
 from api.dependencies import get_alarm_bus, get_db_connection
 from models import AlarmEvent
-from processing.alarm_bus import AlarmBus
+from processing.alarm_bus import AlarmBus, is_subscriber_disconnected
 
 router = APIRouter()
 
@@ -199,6 +199,10 @@ async def alarms_stream(
                 # so it is measured even when no SSE client is connected. Sampling here as well
                 # would double-count, so the stream only delivers frames.
                 yield _sse_payload(alarm)
+                if is_subscriber_disconnected(queue):
+                    # Evicted for being saturated: no further alarms will arrive on this queue.
+                    # Close the connection; the client must reconnect with `since` to resume.
+                    break
         finally:
             await alarm_bus.unsubscribe(room_id, queue)
 

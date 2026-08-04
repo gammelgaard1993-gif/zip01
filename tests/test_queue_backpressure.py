@@ -187,15 +187,18 @@ class SubscriberPriorityInversionTests(unittest.TestCase):
 
     @staticmethod
     def _raw(event_type: str, device_id: str) -> bytes:
-        return json.dumps(
-            {
-                "device_id": device_id,
-                "room_id": "room_1",
-                "type": event_type,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "seq": 1,
-            }
-        ).encode("utf-8")
+        body: dict[str, object] = {
+            "device_id": device_id,
+            "room_id": "room_1",
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "seq": 1,
+        }
+        if event_type == "motion":
+            body["magnitude"] = 0.5
+        elif event_type == "fall_warn":
+            body["confidence"] = 0.9
+        return json.dumps(body).encode("utf-8")
 
     def test_high_delivered_and_acked_while_normal_backpressured(self) -> None:
         loop = asyncio.new_event_loop()
@@ -316,15 +319,18 @@ class NormalManualAckBackpressureTests(unittest.TestCase):
 
     @staticmethod
     def _raw(event_type: str, device_id: str) -> bytes:
-        return json.dumps(
-            {
-                "device_id": device_id,
-                "room_id": "room_1",
-                "type": event_type,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "seq": 1,
-            }
-        ).encode("utf-8")
+        body: dict[str, object] = {
+            "device_id": device_id,
+            "room_id": "room_1",
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "seq": 1,
+        }
+        if event_type == "motion":
+            body["magnitude"] = 0.5
+        elif event_type == "fall_warn":
+            body["confidence"] = 0.9
+        return json.dumps(body).encode("utf-8")
 
     @staticmethod
     def _normal_event() -> ValidatedEvent:

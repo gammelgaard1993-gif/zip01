@@ -41,7 +41,10 @@ committed transactions except on OS/power loss (which snapshot + replay recovery
 - Every accepted event is inserted into `events` at admission — before the `POST /events` `202`
   and before the MQTT puback — so durability never depends on the worker finishing. A storage
   error surfaces as `503` / a withheld ack instead of a false accept.
-- `fall_warn` handler inserts into `fall_warnings` after Redis dedup acceptance.
+- `fall_warn` handler inserts into `fall_warnings` first (SQLite `UNIQUE(dedup_key)` is the
+  authoritative reservation); Redis is written only after a successful insert, as a best-effort,
+  non-gating cache. This avoids a persistence failure permanently suppressing an alarm (a Redis
+  reservation taken before a failed insert would make a legitimate retry look like a duplicate).
 - After commit, the inserted row ID is attached to the live `AlarmEvent`, allowing SSE consumers
   to suppress replay/live overlap without missing or duplicating alarms.
 - Commits are explicit (`db_connection.commit()`) per insertion path.

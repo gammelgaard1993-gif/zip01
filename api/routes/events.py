@@ -39,11 +39,20 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
-    body = await request.body()
-    if len(body) > config.MAX_EVENT_BYTES:
-        increment_counter("events_rejected_too_large")
-        response.status_code = 413
-        return {"error": "payload_too_large"}
+    # A declared Content-Length over the cap is a fast reject, but the header is untrusted (it can
+    # be missing or lie) and `request.body()` would buffer the whole thing before we can check it.
+    # Read the body incrementally instead and abort as soon as the running total exceeds the cap,
+    # so an oversized/chunked-transfer body is never fully materialized in memory.
+    chunks: list[bytes] = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > config.MAX_EVENT_BYTES:
+            increment_counter("events_rejected_too_large")
+            response.status_code = 413
+            return {"error": "payload_too_large"}
+        chunks.append(chunk)
+    body = b"".join(chunks)
 
     # 1) Parse body. Non-JSON or non-object -> 400.
     try:

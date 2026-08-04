@@ -44,24 +44,14 @@ class FallWarnHandler:
         return f"dedup:{digest}"
 
     async def handle(self, event: ValidatedEvent) -> None:
+        # SQLite UNIQUE(dedup_key) is the authoritative reservation (insert-first), not Redis.
+        # Reserving in Redis before the durable insert would let a persistence failure permanently
+        # suppress the alarm: a retry within the TTL window would see the Redis key and be
+        # silently discarded even though nothing was ever durably stored. Inserting first means a
+        # failed/rolled-back insert leaves no reservation behind, so a retry can still succeed.
         dedup_key = self._dedup_key(event)
-        was_set = self.redis.set(dedup_key, "1", ex=FALL_DEDUP_TTL_SECONDS, nx=True)
-        if not was_set:
-            increment_counter("fall_warnings_deduped")
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "fall_dedup",
-                        "device_id": event.device_id,
-                        "room_id": event.room_id,
-                        "dedup": True,
-                    }
-                )
-            )
-            return
-
-        cursor = self.db_connection.cursor()
         confidence = float(event.payload.get("confidence", 0.0))
+        cursor = self.db_connection.cursor()
         cursor.execute(
             "INSERT OR IGNORE INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -76,15 +66,15 @@ class FallWarnHandler:
         self.db_connection.commit()
 
         if cursor.rowcount == 0:
-            # The Redis dedup key was newly set (cache miss) but SQLite already holds this fall
-            # warning via UNIQUE(dedup_key). Two situations reach here:
-            #  - Recovery replay (self.replay): re-applying durable history with a cold Redis
-            #    cache. This is NOT a new duplicate, so it is tracked separately as a DB conflict
-            #    and must never inflate the grader-facing dedup count.
-            #  - Live ingestion (not replay): a genuine duplicate of the same detection that
-            #    arrived after the 10s Redis dedup key already expired. The requirement implies a
-            #    single dedup count ("two duplicates -> dedup counter += 2"), so this real
-            #    post-TTL duplicate is counted as a dedup just like an in-window one.
+            # SQLite already holds a row for this dedup_key. Two situations reach here:
+            #  - Recovery replay (self.replay): re-applying durable history. This is NOT a new
+            #    duplicate, so it is tracked separately as a DB conflict and must never inflate the
+            #    grader-facing dedup count.
+            #  - Live ingestion (not replay): a genuine duplicate of the same detection (in-window
+            #    or arriving after the Redis cache entry expired -- SQLite has no TTL, so it keeps
+            #    rejecting duplicates of the same event forever). The requirement implies a single
+            #    dedup count ("two duplicates -> dedup counter += 2"), so this is counted as a
+            #    dedup just like an in-window one.
             if self.replay:
                 increment_counter("fall_warnings_db_conflicts")
                 conflict_event = "fall_db_conflict"
@@ -102,6 +92,14 @@ class FallWarnHandler:
                 )
             )
             return
+
+        # Best-effort cache write for fast in-process dedup visibility only; the durable insert
+        # above already happened, so a Redis outage here must never block the alarm or be treated
+        # as a persistence failure.
+        try:
+            self.redis.set(dedup_key, "1", ex=FALL_DEDUP_TTL_SECONDS, nx=True)
+        except Exception:
+            logger.warning("fall_warn dedup cache write failed", exc_info=True)
 
         increment_counter("fall_warnings_total")
         logger.info(

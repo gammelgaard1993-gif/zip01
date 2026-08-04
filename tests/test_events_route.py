@@ -5,7 +5,7 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, AsyncIterator, cast
 from unittest.mock import patch
 
 from fastapi import Response
@@ -29,7 +29,7 @@ def _new_events_db() -> sqlite3.Connection:
 
 
 class _FakeRequest:
-    # Minimal stand-in for fastapi.Request: the route only touches .headers, .body(),
+    # Minimal stand-in for fastapi.Request: the route only touches .headers, .stream(),
     # .app.state.event_queue and .app.state.db_connection, so we avoid a full ASGI/TestClient
     # (and its Redis lifespan).
     def __init__(
@@ -48,8 +48,12 @@ class _FakeRequest:
             state=SimpleNamespace(event_queue=event_queue, db_connection=self.db_connection)
         )
 
-    async def body(self) -> bytes:
-        return self._body
+    async def stream(self) -> AsyncIterator[bytes]:
+        # Split into small chunks (rather than one blob) so the route's running-total size check
+        # is genuinely exercised incrementally, like a real streamed request body.
+        chunk_size = 4096
+        for offset in range(0, len(self._body), chunk_size):
+            yield self._body[offset : offset + chunk_size]
 
 
 def _flat_event(event_type: str = "heartbeat", **extra: Any) -> bytes:
@@ -222,6 +226,45 @@ class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(result, {"status": "accepted"})
         self.assertEqual(queue.qsize(), 1)
+
+    async def test_unbounded_stream_without_content_length_aborts_early(self) -> None:
+        # Defends against a missing/lying Content-Length combined with a body far larger than
+        # MAX_EVENT_BYTES (e.g. chunked transfer-encoding): the route must stop pulling chunks as
+        # soon as the running total exceeds the cap, never fully draining the stream. Before the
+        # streaming fix, `await request.body()` would have consumed the entire (here, unbounded)
+        # stream before any size check ran.
+        chunk_size = 4096
+        chunks_yielded = 0
+        # Far more data than could ever legitimately be needed to prove the cap trips.
+        total_available_chunks = (config.MAX_EVENT_BYTES // chunk_size) * 1000
+
+        class _UnboundedStreamRequest:
+            headers = None
+
+            def __init__(self) -> None:
+                self.app = SimpleNamespace(
+                    state=SimpleNamespace(event_queue=queue, db_connection=_new_events_db())
+                )
+
+            async def stream(self) -> AsyncIterator[bytes]:
+                nonlocal chunks_yielded
+                for _ in range(total_available_chunks):
+                    chunks_yielded += 1
+                    yield b"z" * chunk_size
+
+        queue = PriorityEventQueue(100)
+        request = _UnboundedStreamRequest()
+        response = Response()
+
+        before = get_counters().get("events_rejected_too_large", 0)
+        result = await ingest_event(cast(Any, request), response)
+        after = get_counters().get("events_rejected_too_large", 0)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(result, {"error": "payload_too_large"})
+        self.assertEqual(after - before, 1)
+        # Aborted after only a handful of chunks -- nowhere near the full (huge) stream.
+        self.assertLess(chunks_yielded * chunk_size, config.MAX_EVENT_BYTES * 2)
 
 
 if __name__ == "__main__":

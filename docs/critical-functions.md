@@ -13,6 +13,15 @@ Inputs:
 - `raw`: a flat event dict with envelope keys `device_id`, `room_id`, `type`, `ts` (required)
   and optional `seq`. All other top-level keys (e.g. `in_room`, `magnitude`, `state`,
   `confidence`, `rssi`) are collected into `payload`; there is no nested `payload` on the wire.
+- `type` must be one of the 6 documented types (`heartbeat`, `presence`, `motion`, `sleep_state`,
+  `fall_warn`, `net_status`); any other value is rejected as `invalid_schema` instead of being
+  silently accepted at NORMAL priority.
+- Per-type payload fields are schema-checked, not just collected: `in_room` (presence) must be a
+  real `bool` (a string like `"false"` is rejected rather than coerced, since `bool("false")` is
+  `True`); `confidence` (fall_warn) must be a finite number in `[0, 1]`; `magnitude` (motion) and
+  `rssi` (net_status) must be finite numbers; `state` (sleep_state) must be a non-empty string.
+  Each of these fields is required for its type; a missing or wrong-typed field is rejected as
+  `invalid_schema`.
 
 Outputs:
 - `ValidatedEvent` with UTC `ts`, derived `payload`, `late`, `priority`, `received_at`, `seq`.
@@ -39,8 +48,13 @@ Outputs:
   `503` (`{"error": "persist_failed"}`) when the durable write fails.
 
 Side effects:
-- Rejects bodies over `MAX_EVENT_BYTES` (16 KB) with `413` before parsing (checks declared
-  `Content-Length` then actual byte length) and increments `events_rejected_too_large`.
+- Rejects bodies over `MAX_EVENT_BYTES` (16 KB) with `413` before parsing. First checks the
+  declared `Content-Length` header as a fast path, then reads the body incrementally via
+  `request.stream()`, aborting with `413` as soon as the running total exceeds the cap. This
+  means an oversized body is never fully buffered into memory, even with a missing or lying
+  `Content-Length` header (or chunked transfer-encoding with no declared length) — the previous
+  implementation used `await request.body()`, which fully materialized the entire body before the
+  size check could run. Increments `events_rejected_too_large` either way.
 - Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
   event is crash-safe. A storage error returns `503`, increments `events_persist_failed`, and the
   event is neither enqueued nor accepted.
@@ -66,9 +80,16 @@ Side effects:
 - Increments ingest/reject/pressure counters and logs structured ingest/rejection events.
 - Hands the event to the event loop without blocking the MQTT delivery thread; a saturated
   normal lane pauses (never drops) NORMAL, while HIGH `fall_warn` events are never stalled.
+- The QoS-1 ack (`client.ack(...)`) is deferred via `future.add_done_callback(...)` for every
+  event (HIGH and NORMAL alike) and only fires once persist+enqueue actually succeeds. An
+  exception (e.g. a durable-write failure) leaves the message un-acked — the broker redelivers
+  it — instead of acking ahead of durability and losing it silently. Failures increment
+  `events_persist_failed` and log `mqtt_enqueue_failed`.
 
 Failure behavior:
-- Rejects and logs invalid payloads/validation failures.
+- Rejects and logs invalid payloads/validation failures (including non-UTF-8 payloads, caught
+  alongside invalid JSON) and acks them immediately — redelivery can't fix a permanently
+  malformed message.
 - Raises runtime error only if the async loop was not initialized.
 
 ## Queue and Worker Orchestration
@@ -144,6 +165,10 @@ Side effects:
 
 Failure behavior:
 - Invalid stored timestamp in hash is treated as missing and replaced by newer event.
+- `in_room` must be a real `bool`; a non-bool value raises `TypeError` instead of being coerced
+  (`bool("false")` is `True`). This guards recovery replay, which rebuilds events from durable
+  storage without re-running ingestion-time validation; the raised error is quarantined by the
+  worker's per-handler isolation (live path) or `_replay_events`'s `TypeError` catch (replay path).
 
 ### `processing.handlers.fall_warn.FallWarnHandler.handle(event)`
 
@@ -151,18 +176,26 @@ Purpose:
 - Deduplicate fall warnings, persist unique alarms, publish to live subscribers.
 
 Side effects:
-- Writes Redis dedup key with TTL.
-- Inserts into SQLite `fall_warnings`.
-- Publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus` for replay/live
-  overlap reconciliation.
+- Inserts into SQLite `fall_warnings` first (`INSERT OR IGNORE`, `UNIQUE(dedup_key)` is the
+  authoritative reservation), then commits.
+- On a newly-inserted row, best-effort writes a Redis dedup key with TTL (`config.py`) as a
+  non-gating cache, then publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus`
+  for replay/live overlap reconciliation.
 - Updates alarm/dedup/conflict counters.
 
 Failure behavior:
-- Duplicate in Redis dedup window returns early (counts `fall_warnings_deduped`).
-- SQLite unique conflict after a Redis miss returns early. On the live path this is a real
-  post-TTL duplicate and also counts `fall_warnings_deduped`; during recovery replay
-  (`replay=True`) it is an expected re-apply and counts `fall_warnings_db_conflicts` instead, so
-  the dedup count is never inflated by recovery.
+- SQLite is the sole gate: reserving in Redis before the durable insert would let a persistence
+  failure permanently suppress the alarm (a retry within the old TTL window would see the Redis
+  key and be silently discarded even though nothing was ever stored). Inserting into SQLite first
+  means a failed/rolled-back insert leaves no reservation behind, so a retry of the same event can
+  still succeed.
+- A Redis outage on the best-effort cache write after a successful insert is logged and swallowed;
+  it never blocks the durable insert or the alarm publish.
+- `INSERT OR IGNORE` conflict (`cursor.rowcount == 0`) means SQLite already holds this
+  `dedup_key`. On the live path this is a real duplicate (in-window or after the Redis cache entry
+  would have expired -- SQLite has no TTL) and counts `fall_warnings_deduped`; during recovery
+  replay (`replay=True`) it is an expected re-apply and counts `fall_warnings_db_conflicts`
+  instead, so the dedup count is never inflated by recovery.
 
 ## API Computation Functions
 
@@ -201,6 +234,32 @@ Behavior:
 
 Failure behavior:
 - On disconnect/cancellation, unsubscribes cleanly in `finally`.
+- If this subscriber's queue saturates (`SSE_SUBSCRIBER_QUEUE_MAX_SIZE`, e.g. a stalled/slow
+  client not draining fast enough), `AlarmBus` evicts it rather than blocking dispatch to other
+  subscribers (see below); once the route observes the eviction and the queue has fully drained,
+  it breaks out of the consume loop and the SSE connection closes. The client must reconnect with
+  `since=<last seen ts>` to resume without a gap.
+
+### `processing.alarm_bus.AlarmBus`
+
+Purpose:
+- Per-room pub/sub fan-out for fall-warn alarms, with a short reorder buffer
+  (`ALARM_REORDER_BUFFER_MS`) before dispatch.
+
+Behavior:
+- `subscribe(room_id)` returns a bounded `asyncio.Queue[AlarmEvent]` (maxsize
+  `SSE_SUBSCRIBER_QUEUE_MAX_SIZE`) so one slow consumer cannot grow memory without limit.
+- `_dispatch_room` fans out each buffered alarm to every subscriber via `put_nowait`. If a
+  subscriber's queue is full, that subscriber is evicted (unsubscribed, and its queue's
+  `disconnected` flag is set) instead of blocking — this is what keeps one stalled client from
+  stalling delivery to every other subscriber in the room. Increments
+  `sse_subscribers_evicted` on eviction.
+
+Failure behavior:
+- Publishing/dispatch never blocks on a saturated subscriber; eviction is the only consequence.
+- A caller looping on `queue.get()` (e.g. `alarms_stream`, or the `stream()` helper) can detect an
+  evicted-and-drained queue and intentionally stop, rather than waiting forever on a queue that
+  will never receive anything new again.
 
 ### `api.routes.alarms.get_alarms(...)`
 
@@ -241,4 +300,7 @@ Details:
 - Reconstructs `ValidatedEvent` with priority derived from event type.
 
 Failure behavior:
-- Skips rows failing parse/JSON/schema conversion and continues.
+- Skips rows failing parse/JSON/schema conversion **and** rows whose handler raises `TypeError`
+  during replay (e.g. a malformed payload value that coerces cleanly to JSON but fails a
+  handler's numeric conversion); the row is logged (`replay_row_skipped`) and replay continues
+  rather than aborting.

@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import unittest
 from datetime import datetime, timezone
+from typing import Any, cast
 
 from core.metrics import get_counters
 from models import Priority, ValidatedEvent
@@ -176,6 +177,123 @@ class FallWarnDedupTests(unittest.TestCase):
 
         self.assertEqual(deduped_delta, 1)
         self.assertEqual(conflict_delta, 0)
+
+
+class FallWarnDedupAtomicityTests(unittest.TestCase):
+    """SQLite UNIQUE(dedup_key) is the authoritative reservation, not Redis (finding #4)."""
+
+    def setUp(self) -> None:
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute(
+            """
+            CREATE TABLE fall_warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                dedup_key TEXT NOT NULL UNIQUE,
+                received_at TEXT NOT NULL
+            )
+            """
+        )
+        self.db.commit()
+
+    def tearDown(self) -> None:
+        self.db.close()
+
+    def _event(self) -> ValidatedEvent:
+        return ValidatedEvent(
+            device_id="dev_atomic",
+            room_id="room_atomic",
+            type="fall_warn",
+            ts=datetime(2026, 6, 29, 16, 0, 0, tzinfo=timezone.utc),
+            payload={"confidence": 0.9},
+            late=False,
+            priority=Priority.HIGH,
+            received_at=datetime(2026, 6, 29, 16, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_sqlite_insert_failure_leaves_no_redis_reservation(self) -> None:
+        class RaisingCursor:
+            def execute(self, *args: object, **kwargs: object) -> None:
+                raise sqlite3.OperationalError("disk I/O error")
+
+        class RaisingDB:
+            def cursor(self) -> RaisingCursor:
+                return RaisingCursor()
+
+            def commit(self) -> None:
+                raise AssertionError("commit must not run after a failed execute")
+
+        redis = FakeRedis()
+        handler = FallWarnHandler(redis, cast(Any, RaisingDB()), FakeAlarmBus())
+
+        with self.assertRaises(sqlite3.OperationalError):
+            asyncio.run(handler.handle(self._event()))
+
+        self.assertEqual(redis._store, {})
+
+    def test_redis_cache_failure_does_not_block_durable_insert_or_publish(self) -> None:
+        class FailingRedis:
+            def set(self, name: str, value: str, ex: int, nx: bool) -> bool:
+                raise ConnectionError("redis unavailable")
+
+        alarm_bus = FakeAlarmBus()
+        handler = FallWarnHandler(FailingRedis(), self.db, alarm_bus)
+
+        asyncio.run(handler.handle(self._event()))
+
+        self.assertEqual(len(alarm_bus.published), 1)
+        row_count = self.db.execute("SELECT COUNT(*) FROM fall_warnings").fetchone()[0]
+        self.assertEqual(row_count, 1)
+
+    def test_retry_after_failed_insert_can_still_succeed(self) -> None:
+        # A transient failure on the first attempt must not permanently poison the dedup_key: since
+        # no Redis reservation is made before the insert, a retry of the same event can still land.
+        class FlakyCursorWrapper:
+            def __init__(self, real_cursor: sqlite3.Cursor, attempts: dict[str, int]) -> None:
+                self._real_cursor = real_cursor
+                self._attempts = attempts
+
+            def execute(self, *args: object, **kwargs: object) -> object:
+                self._attempts["count"] += 1
+                if self._attempts["count"] == 1:
+                    raise sqlite3.OperationalError("transient disk error")
+                return self._real_cursor.execute(*args, **kwargs)
+
+            @property
+            def rowcount(self) -> int:
+                return self._real_cursor.rowcount
+
+            @property
+            def lastrowid(self) -> int | None:
+                return self._real_cursor.lastrowid
+
+        class FlakyDBWrapper:
+            def __init__(self, real_db: sqlite3.Connection) -> None:
+                self._real_db = real_db
+                self._attempts = {"count": 0}
+
+            def cursor(self) -> FlakyCursorWrapper:
+                return FlakyCursorWrapper(self._real_db.cursor(), self._attempts)
+
+            def commit(self) -> None:
+                self._real_db.commit()
+
+        event = self._event()
+        alarm_bus = FakeAlarmBus()
+        redis = FakeRedis()
+        flaky_db = FlakyDBWrapper(self.db)
+
+        with self.assertRaises(sqlite3.OperationalError):
+            asyncio.run(FallWarnHandler(redis, cast(Any, flaky_db), alarm_bus).handle(event))
+
+        asyncio.run(FallWarnHandler(redis, cast(Any, flaky_db), alarm_bus).handle(event))
+
+        self.assertEqual(len(alarm_bus.published), 1)
+        row_count = self.db.execute("SELECT COUNT(*) FROM fall_warnings").fetchone()[0]
+        self.assertEqual(row_count, 1)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,11 @@ WORKER_NORMAL_QUEUE_MAX_SIZE = 100_000
 DEVICE_REORDER_BUFFER_MS = 100
 ALARM_REORDER_BUFFER_MS = 100
 ALARM_REPLAY_BATCH_SIZE = 500
+# Bound per-SSE-subscriber fan-out memory. A subscriber that stops draining its queue (stalled
+# connection, slow client) is evicted once full rather than growing this queue unbounded or
+# blocking delivery to other subscribers in the same room; the evicted client must reconnect
+# with `since` to resume without a gap.
+SSE_SUBSCRIBER_QUEUE_MAX_SIZE = 1_000
 
 HEARTBEAT_WINDOW_SECONDS = 300
 OCCUPANCY_WINDOW_SECONDS = 3600

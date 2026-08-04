@@ -48,15 +48,32 @@ class _CompletedFuture:
         fn(self)
 
 
+class _FailedFuture:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def result(self) -> None:
+        raise self._exc
+
+    def done(self) -> bool:
+        return True
+
+    def add_done_callback(self, fn: Any) -> None:
+        fn(self)
+
+
 class Phase2ValidatorTests(unittest.TestCase):
     def _raw_event(self, event_type: str = "heartbeat", ts: str | None = None) -> dict[str, object]:
-        return {
+        event: dict[str, object] = {
             "device_id": "dev_1",
             "room_id": "room_1",
             "type": event_type,
             "ts": ts or datetime.now(timezone.utc).isoformat(),
             "seq": 1,
         }
+        if event_type == "fall_warn":
+            event["confidence"] = 0.9
+        return event
 
     def test_validator_assigns_high_priority_for_fall_warn(self) -> None:
         validated = validate_raw_event(self._raw_event(event_type="fall_warn"))
@@ -134,6 +151,52 @@ class Phase2MQTTSubscriberTests(unittest.TestCase):
         increment_counter_mock.assert_any_call("events_ingested_total")
         increment_counter_mock.assert_any_call("events_rejected_invalid_json")
 
+    @patch("ingestion.mqtt_subscriber.increment_counter")
+    def test_on_message_rejects_invalid_utf8(self, increment_counter_mock: MagicMock) -> None:
+        # A payload that isn't valid UTF-8 must be caught (not left to crash the paho callback)
+        # and acked so it doesn't sit stuck in the broker's inflight window forever.
+        queue = PriorityEventQueue(normal_max_size=5)
+        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
+        subscriber.loop = cast(Any, MagicMock())
+        client = cast(Any, MagicMock())
+
+        cast(Any, subscriber)._on_message(client, None, _FakeMQTTMessage(b"\xff\xfe\x00\x01"))
+
+        increment_counter_mock.assert_any_call("events_ingested_total")
+        increment_counter_mock.assert_any_call("events_rejected_invalid_json")
+        client.ack.assert_called_once_with(1, 1)
+
+    @patch("ingestion.mqtt_subscriber.asyncio.run_coroutine_threadsafe")
+    @patch("ingestion.mqtt_subscriber.validate_raw_event")
+    @patch("ingestion.mqtt_subscriber.increment_counter")
+    def test_on_message_does_not_ack_when_enqueue_fails(
+        self,
+        increment_counter_mock: MagicMock,
+        validate_raw_event_mock: MagicMock,
+        run_threadsafe_mock: MagicMock,
+    ) -> None:
+        # If persist/enqueue fails after admission, the message must NOT be acked -- acking here
+        # would tell the broker "delivered" for an event that was never durably written, losing it
+        # for good instead of letting the broker redeliver.
+        queue = PriorityEventQueue(normal_max_size=5)
+        subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
+        subscriber.loop = cast(Any, MagicMock())
+        client = cast(Any, MagicMock())
+
+        validate_raw_event_mock.return_value = self._validated_event(event_type="fall_warn")
+
+        def _run_threadsafe_side_effect(coro: object, loop: object) -> _FailedFuture:
+            if hasattr(coro, "close"):
+                cast(Any, coro).close()
+            return _FailedFuture(RuntimeError("persist failed"))
+
+        run_threadsafe_mock.side_effect = _run_threadsafe_side_effect
+
+        cast(Any, subscriber)._on_message(client, None, _FakeMQTTMessage(b'{"type": "fall_warn"}'))
+
+        client.ack.assert_not_called()
+        increment_counter_mock.assert_any_call("events_persist_failed")
+
     @patch("ingestion.mqtt_subscriber.asyncio.run_coroutine_threadsafe")
     @patch("ingestion.mqtt_subscriber.validate_raw_event")
     @patch("ingestion.mqtt_subscriber.increment_counter")
@@ -167,14 +230,17 @@ class Phase2MQTTSubscriberTests(unittest.TestCase):
             "ts": datetime.now(timezone.utc).isoformat(),
             "seq": 1,
         }
+        client = cast(Any, MagicMock())
         cast(Any, subscriber)._on_message(
-            MagicMock(), None, _FakeMQTTMessage(str(payload).replace("'", '"').encode("utf-8"))
+            client, None, _FakeMQTTMessage(str(payload).replace("'", '"').encode("utf-8"))
         )
 
         increment_counter_mock.assert_any_call("events_ingested_total")
         increment_counter_mock.assert_any_call("queue_pressure")
         validate_raw_event_mock.assert_called_once()
         run_threadsafe_mock.assert_called_once()
+        # Ack fires only after the deferred future resolves successfully.
+        client.ack.assert_called_once_with(1, 1)
 
 
 if __name__ == "__main__":

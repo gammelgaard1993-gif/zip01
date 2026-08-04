@@ -11,6 +11,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from api.routes.alarms import alarms_stream, get_alarms
+from core.metrics import get_counters
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus
 
@@ -279,6 +280,77 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
             [json.loads(chunk.removeprefix("data: ").strip())["device_id"] for chunk in chunks],
             ["dev_0", "dev_1", "dev_2"],
         )
+
+    async def test_saturated_subscriber_is_evicted_and_dispatch_does_not_block(self) -> None:
+        # A subscriber that never drains its queue must be evicted once it saturates, rather than
+        # having AlarmBus._dispatch_room block forever on `queue.put(...)` (the pre-fix behavior),
+        # which would also stall fan-out to every other subscriber in the room.
+        before = get_counters().get("sse_subscribers_evicted", 0)
+        with patch("processing.alarm_bus.SSE_SUBSCRIBER_QUEUE_MAX_SIZE", 2):
+            alarm_bus = AlarmBus()
+            room_id = "room_evict"
+            stalled_queue = await alarm_bus.subscribe(room_id)  # intentionally never read from
+
+            base_ts = datetime(2026, 6, 29, 16, 0, 0, tzinfo=timezone.utc)
+
+            async def _publish_burst() -> None:
+                for index in range(5):
+                    await alarm_bus.publish(
+                        AlarmEvent(
+                            device_id=f"dev_{index}",
+                            room_id=room_id,
+                            ts=base_ts + timedelta(seconds=index),
+                            confidence=0.9,
+                            received_at=base_ts,
+                        )
+                    )
+                await asyncio.sleep(0.2)  # let the reorder-buffer dispatch task run to completion
+
+            await asyncio.wait_for(_publish_burst(), timeout=2.0)
+
+        after = get_counters().get("sse_subscribers_evicted", 0)
+        self.assertGreaterEqual(after - before, 1)
+        # Evicted (capped at the bound) rather than grown to hold all 5 published alarms.
+        self.assertLessEqual(stalled_queue.qsize(), 2)
+
+    async def test_alarm_stream_closes_after_subscriber_is_evicted(self) -> None:
+        # The SSE route's consume loop must eventually close the connection for an evicted,
+        # fully-drained subscriber instead of looping on a queue that will never receive anything
+        # new again (a zombie stream the client would have no way to detect as dead).
+        with patch("processing.alarm_bus.SSE_SUBSCRIBER_QUEUE_MAX_SIZE", 1):
+            alarm_bus = AlarmBus()
+            room_id = "room_evict_stream"
+
+            response = await alarms_stream(
+                room_id=room_id, since=None, db_connection=self.db, alarm_bus=alarm_bus
+            )
+            iterator = cast(AsyncIterator[str], response.body_iterator)
+
+            # The generator subscribes lazily on first iteration, so it must be pumped once
+            # (subscribing it) before publishing -- otherwise the burst below would have no
+            # subscriber to evict at all.
+            first_chunk_task = asyncio.create_task(_next_chunk(iterator))
+            await asyncio.sleep(0.05)
+
+            base_ts = datetime(2026, 6, 29, 17, 0, 0, tzinfo=timezone.utc)
+            for index in range(4):
+                await alarm_bus.publish(
+                    AlarmEvent(
+                        device_id=f"dev_{index}",
+                        room_id=room_id,
+                        ts=base_ts + timedelta(seconds=index),
+                        confidence=0.9,
+                        received_at=base_ts,
+                    )
+                )
+            await asyncio.sleep(0.2)  # let dispatch saturate and evict the sole subscriber
+
+            chunks = [await asyncio.wait_for(first_chunk_task, timeout=2.0)]
+            chunks.extend([chunk async for chunk in iterator])
+
+        # The generator yields whatever made it into the queue before eviction, then breaks
+        # instead of hanging forever once it observes disconnected+drained.
+        self.assertGreaterEqual(len(chunks), 1)
 
 
 if __name__ == "__main__":

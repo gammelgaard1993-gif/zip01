@@ -50,6 +50,18 @@ class FakeRedis:
         entries = sorted(self.zsets.get(name, {}).items(), key=lambda item: item[1])
         return entries
 
+    def zrevrangebyscore(
+        self, name: str, max: float | str, min: float | str, start: int = 0, num: int = 0, withscores: bool = False
+    ) -> list[tuple[str, float]]:
+        lo = float("-inf") if min == "-inf" else float(min)
+        hi = float("inf") if max == "+inf" else float(max)
+        entries = sorted(
+            ((member, score) for member, score in self.zsets.get(name, {}).items() if lo <= score <= hi),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        return entries[start : start + num] if num else entries[start:]
+
     def set(self, name: str, value: str) -> object:
         self.strings[name] = value
         return True
@@ -87,6 +99,10 @@ class _FakePipeline:
         self._ops.append(("set", (name, value)))
         return self
 
+    def hset(self, name: str, mapping: dict[str, str]) -> object:
+        self._ops.append(("hset", (name, mapping)))
+        return self
+
     def zadd(self, name: str, mapping: dict[str, float]) -> object:
         self._ops.append(("zadd", (name, mapping)))
         return self
@@ -100,6 +116,9 @@ class _FakePipeline:
             if op == "set":
                 name, value = args
                 self._redis.strings[name] = value
+            elif op == "hset":
+                name, mapping = args
+                self._redis.hashes[name] = dict(mapping)
             elif op == "zadd":
                 name, mapping = args
                 zset = self._redis.zsets.setdefault(name, {})
@@ -364,6 +383,30 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
             sorted(heartbeats.keys()),
             sorted(ts.isoformat() for ts in (earliest, middle, latest)),
         )
+
+    async def test_replay_quarantines_malformed_row_without_aborting(self) -> None:
+        # A row whose payload can't be applied by its handler (e.g. a pre-existing non-bool
+        # in_room, now rejected by PresenceHandler's own type check) must be skipped, not crash
+        # the whole recovery replay.
+        fake_redis = PipelineFakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        now = datetime.now(timezone.utc)
+        bad_ts = (now - timedelta(seconds=20)).isoformat()
+        good_ts = (now - timedelta(seconds=10)).isoformat()
+        self.db.execute(
+            "INSERT INTO events (device_id, room_id, type, ts, payload, received_at, late) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("dev_bad", "room_1", "presence", bad_ts, json.dumps({"in_room": "false"}), bad_ts, 0),
+        )
+        self.db.execute(
+            "INSERT INTO events (device_id, room_id, type, ts, payload, received_at, late) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("dev_good", "room_1", "presence", good_ts, json.dumps({"in_room": True}), good_ts, 0),
+        )
+        self.db.commit()
+
+        replayed = await cast(Any, manager)._replay_events(since_ts=None)
+
+        self.assertEqual(replayed, 1)
 
     async def test_snapshot_ts_uses_oldest_inflight_received_at(self) -> None:
         # Finding #5: the snapshot replay cutoff must be the oldest in-flight event's received_at,

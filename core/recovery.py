@@ -415,7 +415,13 @@ class RecoveryManager:
                 handler = handlers.get(event_type, handlers["motion"])
                 await handler.handle(event)
                 replayed += 1
-            except (ValueError, ValidationError, json.JSONDecodeError):
+            except (ValueError, ValidationError, json.JSONDecodeError, TypeError):
+                # Quarantine a single malformed durable row (e.g. a payload whose type coercion
+                # blows up in a handler) rather than aborting the whole recovery replay.
+                logger.warning(
+                    json.dumps({"event": "replay_row_skipped", "device_id": device_id, "type": event_type}),
+                    exc_info=True,
+                )
                 continue
 
         return replayed

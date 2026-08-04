@@ -64,7 +64,14 @@ class PresenceHandler:
         key_transitions = f"room:{event.room_id}:occupancy"
         ts_score = event.ts.timestamp()
         ts_value = event.ts.isoformat()
-        in_room = bool(event.payload.get("in_room", False))
+        # Defense in depth: ingestion-time validation guarantees this for the live path, but
+        # recovery replay rebuilds events straight from durable storage without re-validating, so
+        # a non-bool value (e.g. left over from before schema validation existed) must be rejected
+        # here rather than silently coerced -- bool("false") is True and would corrupt occupancy.
+        in_room_raw = event.payload.get("in_room", False)
+        if not isinstance(in_room_raw, bool):
+            raise TypeError(f"in_room must be a boolean, got {type(in_room_raw).__name__}")
+        in_room = in_room_raw
         now_score = datetime.now(timezone.utc).timestamp()
 
         # Cast once to the precise read/pipeline Protocol so hgetall/zrevrangebyscore/pipeline all
