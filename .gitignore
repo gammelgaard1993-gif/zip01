@@ -1,5 +1,7 @@
 # Databases
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 teton.db
@@ -14,6 +16,13 @@ env/
 
 # Env / secrets
 .env
+.env.*
+
+# Logs / local run artifacts
+*.log
+_lat.txt
+test_out.txt
+metrics_before.json
 
 # OS / editor
 .DS_Store
