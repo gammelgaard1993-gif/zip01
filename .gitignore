@@ -31,3 +31,6 @@ metrics_before.json
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Local benchmarking
+_bench.py
