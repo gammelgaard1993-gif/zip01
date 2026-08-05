@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 from typing import Protocol, cast
 
@@ -56,15 +58,33 @@ def _as_text(value: str | bytes | bytearray | memoryview) -> str:
 
 
 class PresenceHandler:
-    def __init__(self, redis_client: Redis) -> None:
+    def __init__(self, redis_client: Redis, executor: Executor | None = None) -> None:
         self.redis = redis_client
+        # Optional shared thread pool: when present, the synchronous redis-py calls below run on
+        # a background thread instead of the event loop (Phase 6 / #13). Left None for recovery
+        # replay and tests, which run the same code synchronously with no behavior change.
+        self._executor = executor
 
     async def handle(self, event: ValidatedEvent) -> None:
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._apply, event)
+        else:
+            self._apply(event)
+
+    def _apply(self, event: ValidatedEvent) -> None:
         key_state = f"room:{event.room_id}:presence"
         key_transitions = f"room:{event.room_id}:occupancy"
         ts_score = event.ts.timestamp()
         ts_value = event.ts.isoformat()
-        in_room = bool(event.payload.get("in_room", False))
+        # Defense in depth: ingestion-time validation guarantees this for the live path, but
+        # recovery replay rebuilds events straight from durable storage without re-validating, so
+        # a non-bool value (e.g. left over from before schema validation existed) must be rejected
+        # here rather than silently coerced -- bool("false") is True and would corrupt occupancy.
+        in_room_raw = event.payload.get("in_room", False)
+        if not isinstance(in_room_raw, bool):
+            raise TypeError(f"in_room must be a boolean, got {type(in_room_raw).__name__}")
+        in_room = in_room_raw
         now_score = datetime.now(timezone.utc).timestamp()
 
         # Cast once to the precise read/pipeline Protocol so hgetall/zrevrangebyscore/pipeline all

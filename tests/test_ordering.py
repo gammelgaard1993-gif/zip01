@@ -5,10 +5,13 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
+from unittest.mock import patch
 
+from core.event_log import persist_validated_event
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
 from processing.alarm_bus import AlarmBus
+from processing.handlers.generic import GenericEventHandler
 from processing.worker_pool import WorkerPool
 
 
@@ -89,7 +92,16 @@ class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.db.close()
 
-    async def test_same_device_out_of_order_arrival_persists_in_ts_order(self) -> None:
+    async def test_same_device_out_of_order_arrival_applies_in_ts_order(self) -> None:
+        # F-05: within the reorder window the worker sorts a device's buffered events by ts before
+        # invoking handlers, so a slightly-late arrival is APPLIED in ts order. Durability itself
+        # now happens at admission (arrival order) and is replayed ORDER BY ts on recovery, so the
+        # meaningful guarantee here is handler application order, not durable-log order.
+        applied_ts: list[datetime] = []
+
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            applied_ts.append(event.ts)
+
         event_queue = PriorityEventQueue(normal_max_size=100)
         pool = WorkerPool(
             event_queue=event_queue,
@@ -97,7 +109,6 @@ class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):
             db_connection=self.db,
             redis_client=cast(Any, FakeRedis()),
         )
-        await pool.start()
 
         base = datetime.now(timezone.utc)
         newer = ValidatedEvent(
@@ -121,16 +132,15 @@ class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):
             received_at=base,
         )
 
-        await event_queue.put(newer)
-        await event_queue.put(older)
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await event_queue.put(newer)
+            await event_queue.put(older)
+            await asyncio.sleep(0.6)
+            await pool.stop()
 
-        await asyncio.sleep(0.6)
-
-        rows = self.db.execute("SELECT ts FROM events ORDER BY id ASC").fetchall()
-        await pool.stop()
-
-        self.assertEqual(len(rows), 2)
-        self.assertLess(datetime.fromisoformat(rows[0][0]), datetime.fromisoformat(rows[1][0]))
+        self.assertEqual(len(applied_ts), 2)
+        self.assertEqual(applied_ts, sorted(applied_ts))
 
     def _heartbeat(self, device_id: str, ts: datetime) -> ValidatedEvent:
         return ValidatedEvent(
@@ -162,11 +172,15 @@ class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):
         await pool.start()
 
         base = datetime.now(timezone.utc).replace(microsecond=0)
-        await event_queue.put(self._heartbeat("dev_1", base))
+        first = self._heartbeat("dev_1", base)
+        persist_validated_event(self.db, first)  # durable at admission
+        await event_queue.put(first)
         await asyncio.sleep(0.3)  # let the first reorder buffer flush complete
 
         # A late heartbeat (30s older) arrives only after the buffer already flushed.
-        await event_queue.put(self._heartbeat("dev_1", base - timedelta(seconds=30)))
+        late = self._heartbeat("dev_1", base - timedelta(seconds=30))
+        persist_validated_event(self.db, late)  # durable at admission
+        await event_queue.put(late)
         await asyncio.sleep(0.3)
         await pool.stop()
 

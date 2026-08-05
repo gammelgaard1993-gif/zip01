@@ -104,6 +104,131 @@ class ValidatorTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.reason, "invalid_schema")
 
+    def test_rejects_unknown_event_type(self) -> None:
+        event = self._base_event()
+        event["type"] = "not_a_real_type"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_in_room_as_string_instead_of_bool(self) -> None:
+        # bool("false") is True in Python; the string must be rejected, not coerced.
+        event = self._base_event()
+        event["type"] = "presence"
+        event["in_room"] = "false"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_accepts_presence_with_real_bool_in_room(self) -> None:
+        event = self._base_event()
+        event["type"] = "presence"
+        event["in_room"] = False
+
+        validated = validate_raw_event(event)
+
+        self.assertEqual(validated.payload, {"in_room": False})
+
+    def test_rejects_presence_missing_in_room(self) -> None:
+        event = self._base_event()
+        event["type"] = "presence"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_fall_warn_confidence_out_of_range(self) -> None:
+        event = self._base_event()
+        event["type"] = "fall_warn"
+        event["confidence"] = 1.5
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_fall_warn_confidence_as_string(self) -> None:
+        event = self._base_event()
+        event["type"] = "fall_warn"
+        event["confidence"] = "0.9"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_fall_warn_non_finite_confidence(self) -> None:
+        event = self._base_event()
+        event["type"] = "fall_warn"
+        event["confidence"] = float("nan")
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_motion_missing_magnitude(self) -> None:
+        event = self._base_event()
+        event["type"] = "motion"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_rejects_motion_non_finite_magnitude(self) -> None:
+        event = self._base_event()
+        event["type"] = "motion"
+        event["magnitude"] = float("inf")
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_accepts_valid_sleep_state(self) -> None:
+        event = self._base_event()
+        event["type"] = "sleep_state"
+        event["state"] = "asleep"
+
+        validated = validate_raw_event(event)
+
+        self.assertEqual(validated.payload, {"state": "asleep"})
+
+    def test_rejects_sleep_state_missing_state(self) -> None:
+        event = self._base_event()
+        event["type"] = "sleep_state"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
+    def test_accepts_valid_net_status(self) -> None:
+        event = self._base_event()
+        event["type"] = "net_status"
+        event["rssi"] = -72
+
+        validated = validate_raw_event(event)
+
+        self.assertEqual(validated.payload, {"rssi": -72})
+
+    def test_rejects_net_status_non_numeric_rssi(self) -> None:
+        event = self._base_event()
+        event["type"] = "net_status"
+        event["rssi"] = "strong"
+
+        with self.assertRaises(ValidationError) as ctx:
+            validate_raw_event(event)
+
+        self.assertEqual(ctx.exception.reason, "invalid_schema")
+
 
 if __name__ == "__main__":
     unittest.main()
+

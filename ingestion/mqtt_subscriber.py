@@ -3,31 +3,49 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from concurrent.futures import Future
 from time import perf_counter
+from sqlite3 import Connection
 from typing import Any, cast
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
 from config import MQTT_CLIENT_ID   
+from core.event_log import persist_validated_event, persist_validated_event_async
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
 from core.metrics import increment_counter
-from models import Priority, ValidatedEvent
+from models import ValidatedEvent
 
 logger = logging.getLogger(__name__)
 
 
 class MQTTSubscriber:
-    def __init__(self, broker_url: str, broker_port: int, topic: str, event_queue: PriorityEventQueue) -> None:
+    def __init__(
+        self,
+        broker_url: str,
+        broker_port: int,
+        topic: str,
+        event_queue: PriorityEventQueue,
+        db_connection: Connection,
+    ) -> None:
         self.broker_url = broker_url
         self.broker_port = broker_port
         self.topic = topic
         self.event_queue = event_queue
+        self.db_connection = db_connection
+        # Set by the app wiring when a worker pool is present; used to register in-flight events
+        # for the snapshot replay cutoff. Left as None in unit tests that drive _on_message.
+        self.worker_pool: Any = None
+        # Set by the app wiring when the dedicated batched SQLite writer is present. Left as None
+        # in unit tests, which fall back to a direct synchronous write.
+        self.sqlite_writer: Any = None
         # VERSION2 callbacks construct cleanly under paho 2.x. manual_ack=True gives QoS-1
-        # backpressure without blocking paho's delivery thread: NORMAL pubacks are deferred until
-        # the bounded lane accepts (broker throttles on a full inflight window); 
-        # HIGH is acked at once so fall_warn is never stalled behind NORMAL.
+        # backpressure without blocking paho's delivery thread: every ack is deferred until the
+        # underlying persist+enqueue actually succeeds (see _on_message), so acking never races
+        # ahead of durability; NORMAL additionally throttles once the bounded lane's inflight
+        # window fills with un-acked messages.
         self.client = mqtt.Client(
             CallbackAPIVersion.VERSION2,
             client_id=MQTT_CLIENT_ID,
@@ -53,6 +71,20 @@ class MQTTSubscriber:
 
         try:
             raw_payload = json.loads(msg.payload.decode("utf-8"))
+        except UnicodeDecodeError:
+            # Permanently malformed (not valid UTF-8) — redelivery can't fix this, so ack and drop 
+            # it now rather than leaving it stuck in the broker's inflight window forever.
+            increment_counter("events_rejected_invalid_json")
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "invalid_utf8",
+                        "topic": msg.topic,
+                    }
+                )
+            )
+            client.ack(msg.mid, msg.qos)
+            return
         except json.JSONDecodeError:
             increment_counter("events_rejected_invalid_json")
             logger.warning(
@@ -147,21 +179,48 @@ class MQTTSubscriber:
         # following HIGH fall_warn behind NORMAL work (priority inversion).
         submit_perf = perf_counter()
         mid, qos = msg.mid, msg.qos
+        device_id, event_type = validated.device_id, validated.type
         future = asyncio.run_coroutine_threadsafe(
             self._enqueue(validated, was_pressured, submit_perf), self.loop
         )
 
-        if validated.priority == Priority.HIGH:
-            # Unbounded HIGH lane resolves at once; ack immediately so fall_warn never waits.
+        # Ack only once durable admission (persist + enqueue) actually succeeds — never eagerly.
+        # An eager ack that races ahead of `_enqueue` would tell the broker "delivered" before the
+        # write happened; if persist then failed, the message is gone for good (no redelivery).
+        # add_done_callback doesn't block the paho thread even when the loop is busy, so HIGH
+        # still isn't stalled behind NORMAL work — it just isn't acked until genuinely durable.
+        def _on_enqueue_done(done_future: "Future[None]") -> None:
+            try:
+                done_future.result()
+            except Exception:
+                increment_counter("events_persist_failed")
+                logger.error(
+                    json.dumps(
+                        {
+                            "event": "mqtt_enqueue_failed",
+                            "device_id": device_id,
+                            "type": event_type,
+                        }
+                    ),
+                    exc_info=True,
+                )
+                # Do not ack: leave it in the broker's inflight window so it gets redelivered
+                # instead of being silently lost.
+                return
             client.ack(mid, qos)
-            return
 
-        # NORMAL: defer the puback until the bounded lane accepts. The broker throttles once its
-        # inflight window fills with un-acked NORMAL — real QoS-1 backpressure, no drops, no block.
-        # The callback runs on the loop thread; paho socket writes are mutex-guarded, so it's safe.
-        future.add_done_callback(lambda _f: client.ack(mid, qos))
+        future.add_done_callback(_on_enqueue_done)
 
     async def _enqueue(self, event: ValidatedEvent, was_pressured: bool, submit_perf: float) -> None:
+        # Persist-before-ack: write the durable `events` row before enqueueing, so an acknowledged
+        # MQTT message is already durable. Routes through the dedicated batched writer when
+        # present (keeps the loop unblocked); falls back to a direct synchronous write otherwise.
+        if self.sqlite_writer is not None:
+            await persist_validated_event_async(self.sqlite_writer, event)
+        else:
+            persist_validated_event(self.db_connection, event)
+        if self.worker_pool is not None:
+            self.worker_pool.mark_inflight(event.received_at.isoformat())
         # On the loop: HIGH returns at once; a full NORMAL lane awaits capacity (delays, never drops).
         await self.event_queue.put(event)
 

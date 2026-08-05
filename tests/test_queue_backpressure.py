@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 import unittest
 import warnings
 from datetime import datetime, timezone
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from config import HIGH_QUEUE_MAX_SIZE
 from ingestion.mqtt_subscriber import MQTTSubscriber
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
+
+
+def _events_db() -> sqlite3.Connection:
+    # check_same_thread=False: _enqueue persists on the loop thread while the test drives from
+    # the main thread, sharing this one connection.
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL, "
+        "received_at TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    return connection
 
 
 class QueueBackpressureTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +97,69 @@ class QueueBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queue.empty())
 
 
+class HighLaneBoundTests(unittest.IsolatedAsyncioTestCase):
+    """The HIGH (fall_warn) lane is bounded by config.HIGH_QUEUE_MAX_SIZE. A full HIGH lane must
+    make ``put`` SUSPEND (backpressure) rather than grow unbounded or silently drop a fall_warn.
+
+    Before the fix the HIGH lane was ``asyncio.Queue()`` (maxsize=0, unbounded): ``put`` never
+    suspended and ``high_queue.maxsize`` was 0, so these tests fail without the bound in place.
+    """
+
+    def _high_event(self, index: int) -> ValidatedEvent:
+        return ValidatedEvent(
+            device_id=f"dev_{index}",
+            room_id="room_1",
+            type="fall_warn",
+            ts=datetime.now(timezone.utc),
+            payload={},
+            late=False,
+            priority=Priority.HIGH,
+            received_at=datetime.now(timezone.utc),
+        )
+
+    async def test_high_lane_maxsize_matches_config(self) -> None:
+        # Minimal guard: the HIGH lane must be bounded by the config constant, not unbounded (0).
+        queue = PriorityEventQueue(normal_max_size=10)
+        self.assertEqual(queue.high_queue.maxsize, HIGH_QUEUE_MAX_SIZE)
+        self.assertGreater(queue.high_queue.maxsize, 0)
+
+    async def test_full_high_lane_backpressures_put_without_dropping(self) -> None:
+        # Patch the module-level constant read by PriorityEventQueue.__init__ to a small bound so
+        # the lane fills at capacity 2 without enqueuing 100k events.
+        with patch("ingestion.queue.HIGH_QUEUE_MAX_SIZE", 2):
+            queue = PriorityEventQueue(normal_max_size=10)
+        self.assertEqual(queue.high_queue.maxsize, 2)
+
+        # Fill the HIGH lane to capacity.
+        await queue.put(self._high_event(1))
+        await queue.put(self._high_event(2))
+        self.assertEqual(queue.qsize_high(), 2)
+
+        # A further HIGH put must NOT complete immediately: it is backpressured (pending), never
+        # dropped and never allowed to grow the lane past its bound.
+        pending_put = asyncio.create_task(queue.put(self._high_event(3)))
+        await asyncio.sleep(0)
+        self.assertFalse(pending_put.done())
+        self.assertEqual(queue.qsize_high(), 2)
+
+        # Freeing one slot lets the backpressured put complete.
+        first = await queue.get()
+        self.assertEqual(first.priority, Priority.HIGH)
+        await asyncio.wait_for(pending_put, timeout=1.0)
+        self.assertEqual(queue.qsize_high(), 2)
+
+        # Nothing was lost: 3 HIGH events in, 3 HIGH events out.
+        drained = [first]
+        while not queue.empty():
+            drained.append(await queue.get())
+        self.assertEqual(len(drained), 3)
+        self.assertTrue(all(event.priority == Priority.HIGH for event in drained))
+        self.assertEqual(
+            {event.device_id for event in drained},
+            {"dev_1", "dev_2", "dev_3"},
+        )
+
+
 class _FakeMQTTMessage:
     def __init__(
         self,
@@ -109,15 +187,18 @@ class SubscriberPriorityInversionTests(unittest.TestCase):
 
     @staticmethod
     def _raw(event_type: str, device_id: str) -> bytes:
-        return json.dumps(
-            {
-                "device_id": device_id,
-                "room_id": "room_1",
-                "type": event_type,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "seq": 1,
-            }
-        ).encode("utf-8")
+        body: dict[str, object] = {
+            "device_id": device_id,
+            "room_id": "room_1",
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "seq": 1,
+        }
+        if event_type == "motion":
+            body["magnitude"] = 0.5
+        elif event_type == "fall_warn":
+            body["confidence"] = 0.9
+        return json.dumps(body).encode("utf-8")
 
     def test_high_delivered_and_acked_while_normal_backpressured(self) -> None:
         loop = asyncio.new_event_loop()
@@ -141,7 +222,7 @@ class SubscriberPriorityInversionTests(unittest.TestCase):
             saturate.result(timeout=1.0)
             self.assertTrue(queue.normal_is_full())
 
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
             subscriber.loop = loop
             client = cast(Any, MagicMock())
 
@@ -222,7 +303,7 @@ class SubscriberConstructionTests(unittest.TestCase):
         queue = PriorityEventQueue(normal_max_size=1)
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
         self.assertIsNotNone(subscriber.client)
 
 
@@ -238,15 +319,18 @@ class NormalManualAckBackpressureTests(unittest.TestCase):
 
     @staticmethod
     def _raw(event_type: str, device_id: str) -> bytes:
-        return json.dumps(
-            {
-                "device_id": device_id,
-                "room_id": "room_1",
-                "type": event_type,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "seq": 1,
-            }
-        ).encode("utf-8")
+        body: dict[str, object] = {
+            "device_id": device_id,
+            "room_id": "room_1",
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "seq": 1,
+        }
+        if event_type == "motion":
+            body["magnitude"] = 0.5
+        elif event_type == "fall_warn":
+            body["confidence"] = 0.9
+        return json.dumps(body).encode("utf-8")
 
     @staticmethod
     def _normal_event() -> ValidatedEvent:
@@ -282,7 +366,7 @@ class NormalManualAckBackpressureTests(unittest.TestCase):
             asyncio.run_coroutine_threadsafe(queue.put(self._normal_event()), loop).result(1.0)
             self.assertTrue(queue.normal_is_full())
 
-            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue)
+            subscriber = MQTTSubscriber("localhost", 1883, "teton/devices/+/events", queue, _events_db())
             subscriber.loop = loop
             client = cast(Any, MagicMock())
 

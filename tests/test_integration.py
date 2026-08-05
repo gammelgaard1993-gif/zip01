@@ -9,6 +9,7 @@ from math import ceil
 from typing import Any, cast
 
 from api.routes.occupancy import room_occupancy
+from core.event_log import persist_validated_event
 from core.recovery import RecoveryManager
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
@@ -249,13 +250,15 @@ class RecoveryEquivalenceTests(unittest.IsolatedAsyncioTestCase):
             for event_type, device_id, room_id, ts, payload in specs
         ]
 
-        # Path A: normal ingestion through the worker pool (also persists events to SQLite).
+        # Path A: normal ingestion. Events are persisted at admission (as the /events route and
+        # MQTT enqueue now do) and processed through the worker pool into live hot state.
         live_redis = FakeRedis()
         queue = PriorityEventQueue(64)
         pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, live_redis))
         await pool.start()
         try:
             for event in events:
+                persist_validated_event(self.db, event)
                 await queue.put(event)
             await asyncio.sleep(0.4)  # allow per-device reorder buffers to flush
         finally:
@@ -306,7 +309,7 @@ class OfflineReplayOccupancyTests(unittest.IsolatedAsyncioTestCase):
         await handler.handle(exit_event)
         await handler.handle(enter)
 
-        response = await room_occupancy("room_off", window="1h", redis_client=cast(Any, redis_client))
+        response = await room_occupancy("room_off", window="1h", redis_client=cast(Any, redis_client), redis_executor=None)
 
         # 20 occupied minutes within a 60-minute window => ~0.333.
         self.assertAlmostEqual(response.occupied_pct, 20.0 / 60.0, delta=0.02)

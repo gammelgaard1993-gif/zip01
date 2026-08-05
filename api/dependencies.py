@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from typing import Protocol, cast
+from concurrent.futures import Executor
+from typing import Optional, Protocol, cast
 
 from fastapi import Request
 from redis import Redis
 from sqlite3 import Connection
 from processing.alarm_bus import AlarmBus
+from core.db_writer import BatchedSQLiteWriter
 
 
 class _AppState(Protocol):
     redis_client: Redis
     db_connection: Connection
     alarm_bus: AlarmBus
+    sqlite_writer: Optional[BatchedSQLiteWriter]
 
 
 def _typed_state(request: Request) -> _AppState:
@@ -28,3 +31,15 @@ def get_db_connection(request: Request) -> Connection:
 
 def get_alarm_bus(request: Request) -> AlarmBus:
     return _typed_state(request).alarm_bus
+
+
+def get_sqlite_writer(request: Request) -> Optional[BatchedSQLiteWriter]:
+    return getattr(request.app.state, "sqlite_writer", None)
+
+
+def get_redis_executor(request: Request) -> Optional[Executor]:
+    # Shared thread pool for offloading synchronous redis-py calls off the event loop (see
+    # api/app.py lifespan). Optional/None in tests that don't wire one up -- routes fall back to
+    # calling Redis directly on the loop in that case.
+    return getattr(request.app.state, "redis_executor", None)
+

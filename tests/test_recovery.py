@@ -50,6 +50,18 @@ class FakeRedis:
         entries = sorted(self.zsets.get(name, {}).items(), key=lambda item: item[1])
         return entries
 
+    def zrevrangebyscore(
+        self, name: str, max: float | str, min: float | str, start: int = 0, num: int = 0, withscores: bool = False
+    ) -> list[tuple[str, float]]:
+        lo = float("-inf") if min == "-inf" else float(min)
+        hi = float("inf") if max == "+inf" else float(max)
+        entries = sorted(
+            ((member, score) for member, score in self.zsets.get(name, {}).items() if lo <= score <= hi),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        return entries[start : start + num] if num else entries[start:]
+
     def set(self, name: str, value: str) -> object:
         self.strings[name] = value
         return True
@@ -87,6 +99,10 @@ class _FakePipeline:
         self._ops.append(("set", (name, value)))
         return self
 
+    def hset(self, name: str, mapping: dict[str, str]) -> object:
+        self._ops.append(("hset", (name, mapping)))
+        return self
+
     def zadd(self, name: str, mapping: dict[str, float]) -> object:
         self._ops.append(("zadd", (name, mapping)))
         return self
@@ -100,6 +116,9 @@ class _FakePipeline:
             if op == "set":
                 name, value = args
                 self._redis.strings[name] = value
+            elif op == "hset":
+                name, mapping = args
+                self._redis.hashes[name] = dict(mapping)
             elif op == "zadd":
                 name, mapping = args
                 zset = self._redis.zsets.setdefault(name, {})
@@ -364,6 +383,123 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
             sorted(heartbeats.keys()),
             sorted(ts.isoformat() for ts in (earliest, middle, latest)),
         )
+
+    async def test_replay_quarantines_malformed_row_without_aborting(self) -> None:
+        # A row whose payload can't be applied by its handler (e.g. a pre-existing non-bool
+        # in_room, now rejected by PresenceHandler's own type check) must be skipped, not crash
+        # the whole recovery replay.
+        fake_redis = PipelineFakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        now = datetime.now(timezone.utc)
+        bad_ts = (now - timedelta(seconds=20)).isoformat()
+        good_ts = (now - timedelta(seconds=10)).isoformat()
+        self.db.execute(
+            "INSERT INTO events (device_id, room_id, type, ts, payload, received_at, late) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("dev_bad", "room_1", "presence", bad_ts, json.dumps({"in_room": "false"}), bad_ts, 0),
+        )
+        self.db.execute(
+            "INSERT INTO events (device_id, room_id, type, ts, payload, received_at, late) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("dev_good", "room_1", "presence", good_ts, json.dumps({"in_room": True}), good_ts, 0),
+        )
+        self.db.commit()
+
+        replayed = await cast(Any, manager)._replay_events(since_ts=None)
+
+        self.assertEqual(replayed, 1)
+
+    async def test_snapshot_ts_uses_oldest_inflight_received_at(self) -> None:
+        # Finding #5: the snapshot replay cutoff must be the oldest in-flight event's received_at,
+        # not wall-clock now(). An event received before the snapshot but still queued/buffered at
+        # capture time would otherwise be excluded from replay (received_at < now) and lost. With
+        # the in-flight watermark, the cutoff is old enough to re-cover it.
+        fake_redis = CaptureFakeRedis()
+        oldest_inflight = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: oldest_inflight,
+        )
+
+        manager.write_snapshot()
+
+        stored_ts = self.db.execute(
+            "SELECT snapshot_ts FROM state_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        self.assertEqual(stored_ts, oldest_inflight)
+
+    async def test_snapshot_ts_falls_back_to_now_when_nothing_inflight(self) -> None:
+        # With nothing in flight the provider returns None, so the cutoff falls back to now().
+        fake_redis = CaptureFakeRedis()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: None,
+        )
+
+        before = datetime.now(timezone.utc)
+        manager.write_snapshot()
+        after = datetime.now(timezone.utc)
+
+        stored_ts = self.db.execute(
+            "SELECT snapshot_ts FROM state_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        stamped = datetime.fromisoformat(stored_ts)
+        self.assertGreaterEqual(stamped, before)
+        self.assertLessEqual(stamped, after)
+
+    async def test_malformed_snapshot_falls_back_to_full_replay(self) -> None:
+        # Finding #6: a corrupt (unparseable) or non-dict snapshot must not crash startup and must
+        # not keep its cutoff; recovery loads it as (None, None) so restore does a full replay.
+        fake_redis = FakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", "{ this is not valid json"),
+        )
+        self.db.commit()
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertIsNone(snapshot_ts)
+        self.assertIsNone(state)
+
+        # A JSON scalar (valid JSON, wrong shape) is also rejected to full replay.
+        self.db.execute("DELETE FROM state_snapshots")
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", json.dumps("not-a-dict")),
+        )
+        self.db.commit()
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertIsNone(snapshot_ts)
+        self.assertIsNone(state)
+
+    async def test_newest_snapshot_chosen_by_id_not_ts(self) -> None:
+        # Because snapshot_ts now holds the (non-monotonic) replay cutoff, the newest snapshot is
+        # chosen by insertion id, not by snapshot_ts. Insert an older-cutoff snapshot AFTER a
+        # newer-cutoff one and confirm the last-inserted row wins.
+        fake_redis = FakeRedis()
+        manager = RecoveryManager(self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus()))
+
+        first_state: SnapshotState = {"strings": {"device:a:last_heartbeat": "t"}, "hashes": {}, "zsets": {}}
+        second_state: SnapshotState = {"strings": {"device:b:last_heartbeat": "t"}, "hashes": {}, "zsets": {}}
+        # First insert has a LATER cutoff ts; second (newer by id) has an EARLIER cutoff ts.
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:05+00:00", json.dumps(first_state)),
+        )
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            ("2026-06-29T12:00:00+00:00", json.dumps(second_state)),
+        )
+        self.db.commit()
+
+        snapshot_ts, state = cast(Any, manager)._load_latest_snapshot()
+        self.assertEqual(snapshot_ts, "2026-06-29T12:00:00+00:00")
+        assert state is not None
+        self.assertIn("device:b:last_heartbeat", state["strings"])
 
 
 if __name__ == "__main__":

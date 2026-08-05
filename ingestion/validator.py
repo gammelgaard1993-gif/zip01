@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, cast
 
@@ -20,6 +21,48 @@ class ValidationError(ValueError):
 # Envelope fields carried on every event. Everything else in the flat payload is a type-specific
 # field (in_room / magnitude / state / confidence / rssi) and is collected into `payload`.
 _ENVELOPE_KEYS = {"device_id", "room_id", "type", "ts", "seq"}
+
+# The 6 documented event types (REQUIREMENTS.md 3.2). Anything else is rejected rather than
+# silently accepted as a NORMAL-priority unknown type.
+_KNOWN_EVENT_TYPES = {"heartbeat", "presence", "motion", "sleep_state", "fall_warn", "net_status"}
+
+
+def _require_finite_number(value: Any, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{field} must be numeric", reason="invalid_schema")
+    if not math.isfinite(value):
+        raise ValidationError(f"{field} must be finite", reason="invalid_schema")
+
+
+def _validate_type_payload(event_type: str, payload: Dict[str, Any]) -> None:
+    # Per-type payload fields are trusted device input; a wrong type here (e.g. in_room as the
+    # string "false") must be rejected rather than coerced, since bool("false") is True in Python.
+    if event_type == "presence":
+        if "in_room" not in payload:
+            raise ValidationError("presence event requires in_room", reason="invalid_schema")
+        if not isinstance(payload["in_room"], bool):
+            raise ValidationError("in_room must be a boolean", reason="invalid_schema")
+    elif event_type == "fall_warn":
+        if "confidence" not in payload:
+            raise ValidationError("fall_warn event requires confidence", reason="invalid_schema")
+        confidence = payload["confidence"]
+        _require_finite_number(confidence, "confidence")
+        if not (0.0 <= confidence <= 1.0):
+            raise ValidationError("confidence must be within [0, 1]", reason="invalid_schema")
+    elif event_type == "motion":
+        if "magnitude" not in payload:
+            raise ValidationError("motion event requires magnitude", reason="invalid_schema")
+        _require_finite_number(payload["magnitude"], "magnitude")
+    elif event_type == "sleep_state":
+        if "state" not in payload:
+            raise ValidationError("sleep_state event requires state", reason="invalid_schema")
+        if not isinstance(payload["state"], str) or not payload["state"]:
+            raise ValidationError("state must be a non-empty string", reason="invalid_schema")
+    elif event_type == "net_status":
+        if "rssi" not in payload:
+            raise ValidationError("net_status event requires rssi", reason="invalid_schema")
+        _require_finite_number(payload["rssi"], "rssi")
+    # heartbeat carries no type-specific fields.
 
 
 def parse_iso_timestamp(value: str) -> datetime:
@@ -57,6 +100,8 @@ def validate_raw_event(raw: Any) -> ValidatedEvent:
         raise ValidationError("room_id must be a non-empty string", reason="invalid_schema")
     if not isinstance(event_type, str) or not event_type:
         raise ValidationError("type must be a non-empty string", reason="invalid_schema")
+    if event_type not in _KNOWN_EVENT_TYPES:
+        raise ValidationError(f"unknown event type: {event_type}", reason="invalid_schema")
 
     # Guard the type before parsing: a non-str ts would make datetime.fromisoformat raise
     # TypeError (not ValueError), which parse_iso_timestamp does not catch.
@@ -71,6 +116,7 @@ def validate_raw_event(raw: Any) -> ValidatedEvent:
 
     # payload = every non-envelope field (in_room / magnitude / state / confidence / rssi ...).
     payload: Dict[str, Any] = {k: v for k, v in raw_object.items() if k not in _ENVELOPE_KEYS}
+    _validate_type_payload(event_type, payload)
 
     ts = parse_iso_timestamp(ts_value)
     now = datetime.now(timezone.utc)

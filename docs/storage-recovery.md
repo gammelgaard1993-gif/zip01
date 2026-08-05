@@ -13,6 +13,7 @@ Managed key families:
 - `dedup:{sha256(...)}` (fall dedup key with TTL)
 
 Primary purpose:
+
 - Fast read-path state for health and occupancy APIs.
 - Short-term dedup and live alarm fan-out support.
 
@@ -27,6 +28,8 @@ Defined in `core/db.py`:
   - Durable deduplicated fall alarms
     (`device_id`, `room_id`, `ts`, `confidence`, `dedup_key`, `received_at`).
   - Uniqueness enforced by `UNIQUE(dedup_key)`.
+  - Composite `(ts, id)` and `(room_id, ts, id)` indexes support stable bounded keyset reads for
+    complete alarm-list responses and race-free SSE replay.
 - `state_snapshots`
   - Periodic serialized capture of managed Redis state (`snapshot_ts`, `state_json`).
 
@@ -36,8 +39,15 @@ committed transactions except on OS/power loss (which snapshot + replay recovery
 
 ## Persistence Semantics
 
-- Every flushed worker event is inserted into `events` before handler-specific logic.
-- `fall_warn` handler inserts into `fall_warnings` after Redis dedup acceptance.
+- Every accepted event is inserted into `events` at admission — before the `POST /events` `202`
+  and before the MQTT puback — so durability never depends on the worker finishing. A storage
+  error surfaces as `503` / a withheld ack instead of a false accept.
+- `fall_warn` handler inserts into `fall_warnings` first (SQLite `UNIQUE(dedup_key)` is the
+  authoritative reservation); Redis is written only after a successful insert, as a best-effort,
+  non-gating cache. This avoids a persistence failure permanently suppressing an alarm (a Redis
+  reservation taken before a failed insert would make a legitimate retry look like a duplicate).
+- After commit, the inserted row ID is attached to the live `AlarmEvent`, allowing SSE consumers
+  to suppress replay/live overlap without missing or duplicating alarms.
 - Commits are explicit (`db_connection.commit()`) per insertion path.
 
 ## Snapshot Semantics
@@ -53,6 +63,12 @@ pipelined batch of value reads. The periodic loop stamps `snapshot_ts` first, th
 capture off the event loop (thread executor) so a large keyspace never freezes ingestion or the
 alarm hot path; the SQLite write stays on the loop thread.
 
+`snapshot_ts` is the **replay cutoff**, set to the oldest in-flight event's `received_at` at
+capture time (falling back to `now()` when nothing is in flight), not wall-clock `now()`. This
+closes a race where an event received before the snapshot but still queued/buffered during capture
+would be absent from both the snapshot and the `received_at`-cutoff replay. Because this cutoff is
+non-monotonic, snapshots are selected by insertion `id` (not `snapshot_ts`) on restore.
+
 Captured Redis structures:
 
 - strings
@@ -63,17 +79,21 @@ Captured Redis structures:
 
 `RecoveryManager.restore_state()`:
 
-1. Load latest snapshot by `snapshot_ts DESC`.
+1. Load the newest snapshot by insertion `id` (skipping any malformed/partially-written row).
 2. Clear managed Redis keys.
 3. Reapply snapshot values.
 4. Replay durable events from `events` in `ts ASC` order.
 
 Replay notes:
 
-- Cutoff is on `received_at` (ingestion order), not `ts` (device clock): a snapshot reflects the
-  events ingested before its wall-clock timestamp, so a late event (old `ts`, ingested after the
-  snapshot) is replayed instead of being silently dropped. Rows are still ordered by `ts ASC`.
+- Cutoff is on `received_at` (ingestion order), not `ts` (device clock): a snapshot's `snapshot_ts`
+  is the oldest in-flight event's `received_at` at capture time, so a late event (old `ts`, or one
+  still queued during capture) is replayed instead of being silently dropped. Rows are ordered by
+  `ts ASC`.
 - Boundary is inclusive (`received_at >= snapshot_ts`) to avoid dropping exact-boundary events.
+- A malformed / non-dict snapshot is rejected (never crashes startup and never keeps its cutoff);
+  recovery falls back to a full replay of the durable log, which is correct because every event is
+  persisted at admission.
 - Replay invokes same handlers used in normal flow.
 - Timestamp-aware handlers avoid stale overwrite of newer state.
 - Malformed rows are skipped instead of failing recovery.

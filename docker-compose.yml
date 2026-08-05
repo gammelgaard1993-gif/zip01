@@ -12,7 +12,7 @@ services:
     container_name: teton-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -23,7 +23,7 @@ services:
     image: eclipse-mosquitto:2
     container_name: teton-mosquitto
     ports:
-      - "1883:1883"
+      - "127.0.0.1:1883:1883"
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       # Back the persistence_location (mosquitto.conf) with a named volume so the
