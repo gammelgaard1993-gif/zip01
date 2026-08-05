@@ -55,10 +55,10 @@ def init_db(path: str = SQLITE_PATH) -> Connection:
 def _apply_pragmas(connection: Connection) -> None:
     # WAL + synchronous=NORMAL for durability/throughput. Under WAL, NORMAL fsyncs
     # only at checkpoints instead of on every commit, so the per-event INSERT+commit on the hot
-    # path no longer pays an fsync each time -- from fsync-per-event the SQLite throughput
-    # ceiling at 5k-50k ev/s. Committed transactions stay crash-safe OBS:except on OS/power loss,
-    # which the snapshot+replay recovery already tolerates. busy_timeout prevents
-    # "database is locked" errors when API read connections overlap the writer.
+    # path no longer pays an fsync each time, raising the SQLite throughput ceiling from
+    # fsync-per-event to roughly 5k-50k ev/s. Committed transactions stay crash-safe except
+    # on OS/power loss, which the snapshot+replay recovery already tolerates. busy_timeout
+    # prevents "database is locked" errors when API read connections overlap the writer.
     connection.execute("PRAGMA journal_mode=WAL;")
     connection.execute("PRAGMA synchronous=NORMAL;")
     connection.execute("PRAGMA busy_timeout=5000;")

@@ -99,6 +99,9 @@ class AlarmBus:
                         await self._evict_saturated_subscriber(room_id, queue)
                         subscriber_queues.remove(queue)
         finally:
+            # Pop-then-recreate happens atomically under the lock, so publish()'s own
+            # locked "create only if no task or task.done()" check can never observe a
+            # gap and schedule a second dispatch task for this room.
             async with self._lock:
                 mapped_task = self._dispatch_tasks.get(room_id)
                 if mapped_task is current_task:

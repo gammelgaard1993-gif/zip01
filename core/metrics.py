@@ -9,7 +9,8 @@ _counter_lock = Lock()
 _counters: Dict[str, int] = defaultdict(int)
 _latency_lock = Lock()
 _MAX_LATENCY_SAMPLES = 5000
-# maxlen makes each append O(1) and drops the oldest sample automatically. This runs on the alarm hot path (AlarmBus._dispatch_room)
+# maxlen makes each append O(1) and evicts the oldest sample automatically.
+# Populated from the alarm hot path (AlarmBus._dispatch_room).
 _alarm_feed_latencies_ms: Deque[float] = deque(maxlen=_MAX_LATENCY_SAMPLES)
 
 
