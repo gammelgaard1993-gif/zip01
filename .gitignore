@@ -18,6 +18,9 @@ env/
 .env
 .env.*
 
+# Submission (internal use only)
+SUBMISSION.md
+
 # Logs / local run artifacts
 *.log
 _lat.txt
