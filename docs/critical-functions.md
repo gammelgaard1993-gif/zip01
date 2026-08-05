@@ -73,39 +73,6 @@ Side effects:
   HIGH `fall_warn` returns immediately under normal/burst load and awaits capacity only when the
   bounded HIGH lane (`HIGH_QUEUE_MAX_SIZE`) is saturated. Events are never dropped.
 
-### `ingestion.mqtt_subscriber.MQTTSubscriber._on_message(...)` (optional transport, off by default)
-
-Purpose:
-
-- Handle the MQTT message callback and bridge the thread-based MQTT client into the async queue
-  when `ENABLE_MQTT=True`.
-
-Inputs:
-
-- MQTT message payload bytes and topic metadata.
-
-Outputs:
-
-- None; enqueues validated event.
-
-Side effects:
-
-- Increments ingest/reject/pressure counters and logs structured ingest/rejection events.
-- Hands the event to the event loop without blocking the MQTT delivery thread; a saturated
-  normal lane pauses (never drops) NORMAL, while HIGH `fall_warn` events are never stalled.
-- The QoS-1 ack (`client.ack(...)`) is deferred via `future.add_done_callback(...)` for every
-  event (HIGH and NORMAL alike) and only fires once persist+enqueue actually succeeds. An
-  exception (e.g. a durable-write failure) leaves the message un-acked — the broker redelivers
-  it — instead of acking ahead of durability and losing it silently. Failures increment
-  `events_persist_failed` and log `mqtt_enqueue_failed`.
-
-Failure behavior:
-
-- Rejects and logs invalid payloads/validation failures (including non-UTF-8 payloads, caught
-  alongside invalid JSON) and acks them immediately — redelivery can't fix a permanently
-  malformed message.
-- Raises runtime error only if the async loop was not initialized.
-
 ## Queue and Worker Orchestration
 
 ### `ingestion.queue.PriorityEventQueue.get()`

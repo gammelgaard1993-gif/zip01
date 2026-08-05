@@ -251,7 +251,8 @@ class RecoveryEquivalenceTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         # Path A: normal ingestion. Events are persisted at admission (as the /events route and
-        # MQTT enqueue now do) and processed through the worker pool into live hot state.
+        # Admission now happens before worker processing, so the event is durable before hot-state
+        # handling.
         live_redis = FakeRedis()
         queue = PriorityEventQueue(64)
         pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, live_redis))

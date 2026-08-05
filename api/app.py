@@ -13,17 +13,12 @@ from api.routes.alarms import router as alarms_router
 from api.routes.metrics import router as metrics_router
 from api.routes.events import router as events_router
 from ingestion.queue import PriorityEventQueue
-from ingestion.mqtt_subscriber import MQTTSubscriber
 from processing.alarm_bus import AlarmBus
 from processing.worker_pool import WorkerPool
 from core.db_writer import BatchedSQLiteWriter
 from core.recovery import RecoveryManager
 from config import (
     NORMAL_QUEUE_MAX_SIZE,
-    ENABLE_MQTT,
-    MQTT_BROKER_URL,
-    MQTT_BROKER_PORT,
-    MQTT_TOPIC,
     REDIS_EXECUTOR_MAX_WORKERS,
 )
 
@@ -56,17 +51,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         redis_executor=app.state.redis_executor,
         sqlite_writer=app.state.sqlite_writer,
     )
-    app.state.mqtt_subscriber = None
-    if ENABLE_MQTT:
-        app.state.mqtt_subscriber = MQTTSubscriber(
-            broker_url=MQTT_BROKER_URL,
-            broker_port=MQTT_BROKER_PORT,
-            topic=MQTT_TOPIC,
-            event_queue=app.state.event_queue,
-            db_connection=app.state.db_connection,
-        )
-        app.state.mqtt_subscriber.worker_pool = app.state.worker_pool
-        app.state.mqtt_subscriber.sqlite_writer = app.state.sqlite_writer
 
     recovery_manager = RecoveryManager(
         db_connection=app.state.db_connection,
@@ -79,16 +63,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await recovery_manager.restore_state()
     await recovery_manager.start_snapshot_loop()
 
-    if app.state.mqtt_subscriber is not None:
-        app.state.mqtt_subscriber.start()
     await app.state.worker_pool.start()
     try:
         yield
     finally:
-        mqtt_subscriber = getattr(app.state, "mqtt_subscriber", None)
-        if mqtt_subscriber is not None:
-            mqtt_subscriber.stop()
-
         worker_pool = getattr(app.state, "worker_pool", None)
         if worker_pool is not None:
             await worker_pool.stop()

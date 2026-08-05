@@ -4,12 +4,11 @@ Real-time streaming backend for sensor events with prioritized processing, Redis
 
 ## Quickstart
 
-Requires Redis (via Docker or a native install) and Python 3.12+. Mosquitto/Docker is
-only needed if you enable the optional MQTT ingestion path (`ENABLE_MQTT=True`).
+Requires Redis (via Docker or a native install) and Python 3.12+.
 
 ```bash
 make deps     # install pinned dependencies
-make run      # start Mosquitto + Redis (Docker) and the service on :8080
+make run      # start Redis (Docker) and the service on :8080
 ```
 
 In a second shell, drive load and inspect the API:
@@ -25,8 +24,8 @@ See [SUBMISSION.md](SUBMISSION.md) for the design summary and [Makefile](Makefil
 
 ### Running on Windows (no `make`/`docker`)
 
-Start Redis and Mosquitto however you prefer (native installs or Docker Desktop),
-then run the service and simulator directly:
+Start Redis however you prefer (native installs or Docker Desktop), then run the
+service and simulator directly:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -39,8 +38,7 @@ python -m unittest discover -s tests -v                    # tests
 
 The service connects to `localhost:6379` (Redis, required) by default and listens on `:8080`.
 HTTP `POST /events` is the primary transport (what the reference generator
-[event_generator/generate.py](event_generator/generate.py) posts to); the MQTT subscriber on
-`localhost:1883` is optional and off by default (`ENABLE_MQTT=False`) — see [config.py](config.py).
+[event_generator/generate.py](event_generator/generate.py) posts to).
 
 ## Documentation
 

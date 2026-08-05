@@ -19,7 +19,7 @@ Protect correctness and durability of foundational state systems: persistence, r
 - Core-layer schemas, persistence/replay behavior, and storage-facing reliability mechanics
 
 ## Does Not Own
-- MQTT intake and validation policy (`ingestion/*`)
+- Ingestion intake and validation policy (`ingestion/*`)
 - Domain/event handling semantics (`processing/*`)
 - API contracts and endpoint behavior (`api/*`)
 

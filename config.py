@@ -1,18 +1,9 @@
 from datetime import timedelta
 
-# HTTP ingestion / API server (primary transport). The reference generator POSTs one flat JSON
+# HTTP ingestion / API server (primary transport). The reference generator POSTS one flat JSON
 # event per request to /events and defaults its --target to port 8080.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8080
-
-# Optional secondary transport. Off by default so the service runs HTTP-only without a broker
-# present; the MQTT_* settings below are only used when this is enabled.
-ENABLE_MQTT = False
-
-MQTT_BROKER_URL = "localhost"
-MQTT_BROKER_PORT = 1883
-MQTT_TOPIC = "teton/devices/+/events"
-MQTT_CLIENT_ID = "zip01-backend"
 
 REDIS_URL = "redis://localhost:6379/0"
 SQLITE_PATH = "./teton.db"
@@ -32,7 +23,7 @@ NORMAL_QUEUE_MAX_SIZE = 500_000
 HIGH_QUEUE_MAX_SIZE = 100_000
 WORKER_COUNT = 8
 # Per-worker NORMAL lane bound. Each worker owns a two-lane priority queue (HIGH drained first),
-# so a full worker NORMAL lane backpressures the router (and in turn the HTTP/MQTT ingress)
+# so a full worker NORMAL lane backpressures the router (and in turn the HTTP ingress)
 # instead of growing an unbounded downstream FIFO. HIGH uses HIGH_QUEUE_MAX_SIZE per worker.
 WORKER_NORMAL_QUEUE_MAX_SIZE = 100_000
 # Small pool of router tasks sharing the global queue, instead of a single router task, so one
@@ -88,4 +79,3 @@ SQLITE_WRITER_PRIORITY_QUEUE_MAX_SIZE = HIGH_QUEUE_MAX_SIZE
 # capture) off the event loop. Local Redis round trips are sub-millisecond, so this comfortably
 # covers the 5k sustained / 50k burst target without the loop ever blocking on I/O.
 REDIS_EXECUTOR_MAX_WORKERS = 32
-

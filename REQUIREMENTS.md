@@ -44,8 +44,7 @@ boundary. The stack below — HTTP ingestion, an in-process priority queue, a ho
 store, and a durable log.
 Use Redis for hot/ephemeral aggregates and SQLite for the durable append-only log;
 both sit behind narrow interfaces and can be swapped for any equivalent store. HTTP
-`POST /events` is the **primary** transport (what the reference generator uses); an
-optional MQTT subscriber can feed the *same* validator and queue as a secondary path.
+`POST /events` is the **primary** transport (what the reference generator uses).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -119,21 +118,6 @@ optional MQTT subscriber can feed the *same* validator and queue as a secondary 
 
 **Must NOT:** perform any aggregation, storage, or business logic.
 
-#### Optional secondary transport — MQTT Subscriber (`ingestion/mqtt_subscriber.py`)
-
-The challenge lets you pick the transport; HTTP is what the reference generator uses.
-An optional MQTT subscriber may feed the *same* Validator and Priority Queue for
-deployments (config.py - `ENABLE_MQTT`, off by default):
-
-| Responsibility | Detail |
-|---|---|
-| Connect to Mosquitto broker | Persistent session, QoS 1 (at-least-once delivery) |
-| Subscribe to wildcard topic | `teton/devices/+/events` |
-| Parse raw payload | JSON decode, schema validation |
-| Forward to Validator | Pass raw event dict |
-
-**Must NOT:** perform any aggregation, storage, or business logic.
-
 ---
 
 ### 3.2 Validator (`ingestion/validator.py`)
@@ -158,7 +142,7 @@ deployments (config.py - `ENABLE_MQTT`, off by default):
 |---|---|
 | Accept validated events | Non-blocking enqueue |
 | Separate lanes | `HIGH` lane (fall_warn) and `NORMAL` lane |
-| Backpressure | If NORMAL lane exceeds capacity, block/slow the `POST /events` response (or pause MQTT ACK on the optional broker path); never drop |
+| Backpressure | If NORMAL lane exceeds capacity, block/slow the `POST /events` response; never drop |
 | Worker handoff | Workers always drain HIGH lane before NORMAL lane |
 
 **Capacity target:** HIGH lane unbounded; NORMAL lane max 500,000 items (covers 10x burst for 30s).
@@ -255,7 +239,7 @@ Device / Event Generator
   │
   │  HTTP  POST /events   (one JSON event)
   │
-  │  on request (optional: MQTT subscriber on_message)
+  │  on request
   ▼
 HTTP /events endpoint
   │
@@ -363,7 +347,7 @@ Redis hot state restored
   │
   ▼
 HTTP /events endpoint resumes accepting POSTs
-  (optional MQTT path: broker redelivers QoS 1 messages from the downtime)
+  (durable log replay covers any downtime gap)
   │
   ▼
 New events processed normally — no gap in state
@@ -578,7 +562,7 @@ Returns the observability counters (see [Section 10](#10-observability-requireme
 ### F-07 — Backpressure
 - [ ] No events silently dropped under any load level
 - [ ] `fall_warn` events processed before all other types (HIGH priority lane)
-- [ ] NORMAL lane has a defined max capacity with back-pressure to the HTTP `/events` handler (and optional MQTT subscriber)
+- [ ] NORMAL lane has a defined max capacity with back-pressure to the HTTP `/events` handler
 - [ ] Delay under 10x burst is logged and measurable
 
 ---
@@ -619,7 +603,7 @@ Returns the observability counters (see [Section 10](#10-observability-requireme
 | Same fall warning sent 3 times in 5 seconds | First accepted, two duplicates discarded, dedup counter += 2 |
 | Same fall warning sent 15 seconds apart | Both accepted (outside 10s dedup window) — two distinct events |
 | Device goes offline 20 min, replays 1,200 events | All accepted, sorted by ts, state retroactively corrected |
-| NORMAL queue reaches max capacity | Back-pressure applied by slowing the `POST /events` response (or MQTT ACK); HIGH lane unaffected |
+| NORMAL queue reaches max capacity | Back-pressure applied by slowing the `POST /events` response; HIGH lane unaffected |
 | Hard kill mid-batch | SQLite WAL ensures no partial writes; recovery replays from last committed event |
 | New device connects (no prior state) | Handled gracefully; health returns 404 until first heartbeat |
 | Room with no presence events | Occupancy returns 0% for all windows; `in_room` = false |
@@ -688,7 +672,6 @@ teton-backend/
 │   └── recovery.py                  # Startup replay + periodic snapshot
 │
 ├── ingestion/
-│   ├── mqtt_subscriber.py           # Optional MQTT connection + message loop
 │   ├── validator.py                 # Schema + clock skew validation
 │   └── queue.py                     # Dual-lane priority queue
 │
@@ -723,5 +706,5 @@ teton-backend/
 
 ---
 
-*Stack: Python + FastAPI + Redis + SQLite + optional Mosquitto MQTT + SSE*
+*Stack: Python + FastAPI + Redis + SQLite + SSE*
 *Last updated: 2026-07-06*
