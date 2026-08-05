@@ -85,12 +85,21 @@ class BatchedSQLiteWriter:
         # Set when _run exits on an unexpected (non-flush) fault, so submit() fails fast instead
         # of silently queuing into a thread that will never drain it again.
         self._dead = False
+        # Signals shutdown out-of-band, never through a bounded queue (see stop()/_get_next): a
+        # sentinel value competing for queue capacity can be rejected by queue.Full under a large
+        # backlog, leaving the thread with nothing telling it to exit.
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         with self._lock:
             if self._thread is not None:
                 return
+            # Clear any job/sentinel left behind by a prior crash racing a stop() call (the crash
+            # path's own drain can run before stop()'s signal lands) so a fresh thread can never
+            # find stale state and misbehave; anything real still here gets its future failed.
+            self._drain_and_fail_all()
             self._dead = False
+            self._stop_event.clear()
             thread = threading.Thread(target=self._run, name="sqlite-writer", daemon=True)
             self._thread = thread
         thread.start()
@@ -101,19 +110,11 @@ class BatchedSQLiteWriter:
             if thread is None:
                 return
             # Reject any submit() racing with shutdown immediately -- closes the orphaned-future
-            # window entirely (rather than narrowing it) and bounds both lanes to a fixed,
-            # finite snapshot so _run is guaranteed to drain down to _STOP in bounded time.
+            # window entirely (rather than narrowing it). Nothing new can land in either lane
+            # after this, so _run is guaranteed to drain both down to empty in bounded time.
             self._dead = True
-        deadline = time.monotonic() + timeout
-        try:
-            # _STOP always goes on the NORMAL lane, never the priority lane: _get_next only
-            # returns it once normal_queue's turn comes up (after everything already ahead of it
-            # there, and only once priority_queue is empty), so nothing queued before stop() was
-            # called in EITHER lane is ever skipped past or orphaned.
-            self._normal_queue.put(_STOP, timeout=max(0.0, deadline - time.monotonic()))
-        except queue.Full:
-            logger.warning("sqlite writer stop: normal queue still full, proceeding to join without STOP")
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            self._stop_event.set()
+        thread.join(timeout=timeout)
         if thread.is_alive():
             logger.warning("sqlite writer stop: thread did not exit within timeout, leaving it running")
             return  # do NOT clear self._thread here -- start() must never spawn a second thread over a live one
@@ -189,6 +190,11 @@ class BatchedSQLiteWriter:
                 return self._priority_queue.get_nowait()
             except queue.Empty:
                 pass
+            if self._stop_event.is_set() and self._normal_queue.empty():
+                # Shutdown requested and both lanes drained (nothing new can land in either once
+                # stop() has set _dead) -- signal exit without ever needing to place a sentinel
+                # into a queue that could reject it under a full backlog.
+                return _STOP
             wait_for = poll_interval
             if deadline is not None:
                 remaining = deadline - time.monotonic()

@@ -169,15 +169,22 @@ class RecoveryManager:
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(interval_seconds)
-            # Stamp the snapshot time BEFORE capturing so any event applied while the capture runs
-            # has received_at >= snapshot_ts and is therefore replayed on recovery (see
-            # _replay_events). Capture the Redis state off the event loop: SCAN + pipelined reads
-            # are still O(N) work and must not freeze ingestion or the alarm hot path. The Redis
-            # client is thread-safe, but the SQLite write stays on the loop thread so the shared
-            # connection is never used by two threads at once.
-            snapshot_ts = self._current_snapshot_ts()
-            state_json = await loop.run_in_executor(self._redis_executor, self._capture_state_json)
-            self._persist_snapshot(snapshot_ts, state_json)
+            try:
+                # Stamp the snapshot time BEFORE capturing so any event applied while the capture
+                # runs has received_at >= snapshot_ts and is therefore replayed on recovery (see
+                # _replay_events). Capture the Redis state off the event loop: SCAN + pipelined
+                # reads are still O(N) work and must not freeze ingestion or the alarm hot path.
+                # The Redis client is thread-safe, but the SQLite write stays on the loop thread
+                # so the shared connection is never used by two threads at once.
+                snapshot_ts = self._current_snapshot_ts()
+                state_json = await loop.run_in_executor(self._redis_executor, self._capture_state_json)
+                self._persist_snapshot(snapshot_ts, state_json)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single failed cycle (transient Redis/SQLite error) must never permanently kill
+                # periodic snapshotting -- log and retry on the next interval instead.
+                logger.exception("snapshot cycle failed, will retry next interval")
 
     def write_snapshot(self) -> None:
         # Synchronous, on-demand snapshot (e.g. graceful shutdown); the periodic path is _snapshot_loop.
