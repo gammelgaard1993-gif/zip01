@@ -56,6 +56,10 @@ EVENT_PAST_LIMIT = timedelta(hours=1)
 MAX_EVENT_BYTES = 16_384
 
 STATE_SNAPSHOT_INTERVAL_SECONDS = 60
+# Snapshots are only ever read by "newest one" (see core/recovery.py _load_latest_snapshot), so
+# older rows exist purely for audit/debugging. Pruned after every insert to keep state_snapshots
+# from growing unbounded over a long-running deployment.
+STATE_SNAPSHOT_RETENTION_COUNT = 20
 
 FALL_DEDUP_TTL_SECONDS = 10
 
@@ -65,6 +69,14 @@ FALL_DEDUP_TTL_SECONDS = 10
 # core/db_writer.py).
 SQLITE_WRITER_BATCH_WINDOW_SECONDS = 0.005
 SQLITE_WRITER_MAX_BATCH_SIZE = 200
+# Bounds the writer thread's internal NORMAL-lane backlog so a stalled/slow disk backpressures
+# callers (submit() fails fast with SQLiteWriterError) instead of growing memory unbounded -- the
+# same backpressure-over-drop policy already applied to every other queue in this system.
+SQLITE_WRITER_QUEUE_MAX_SIZE = 200_000
+# Separate, independently-bounded PRIORITY-lane (fall_warn) backlog so a NORMAL-lane flood can
+# never reject a priority write with queue.Full -- sized the same as HIGH_QUEUE_MAX_SIZE since
+# both bound the same upstream fall_warn traffic, far above any real fall_warn burst.
+SQLITE_WRITER_PRIORITY_QUEUE_MAX_SIZE = HIGH_QUEUE_MAX_SIZE
 
 # Shared thread pool for offloading synchronous redis-py calls (handlers + recovery snapshot
 # capture) off the event loop. Local Redis round trips are sub-millisecond, so this comfortably

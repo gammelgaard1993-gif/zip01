@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -8,8 +9,20 @@ from typing import Any
 
 import asyncio
 
-from config import SQLITE_PATH, SQLITE_WRITER_BATCH_WINDOW_SECONDS, SQLITE_WRITER_MAX_BATCH_SIZE
+from config import (
+    SQLITE_PATH,
+    SQLITE_WRITER_BATCH_WINDOW_SECONDS,
+    SQLITE_WRITER_MAX_BATCH_SIZE,
+    SQLITE_WRITER_PRIORITY_QUEUE_MAX_SIZE,
+    SQLITE_WRITER_QUEUE_MAX_SIZE,
+)
 from core.db import get_db_connection
+
+logger = logging.getLogger(__name__)
+
+
+class SQLiteWriterError(RuntimeError):
+    """Raised when a write can't be handed to the writer thread (queue full or thread dead)."""
 
 
 @dataclass
@@ -24,6 +37,12 @@ class _WriteJob:
 
 
 _STOP = object()
+
+# Cadence for _get_next's idle re-check of the priority lane while parked on the normal lane.
+# Deliberately fixed and small, NOT tied to a writer instance's (configurable) batch_window_seconds
+# -- that window governs NORMAL-lane commit batching, a different concern, and priority dispatch
+# latency must stay bounded even when batch_window_seconds is configured much larger (e.g. tests).
+_PRIORITY_POLL_INTERVAL_SECONDS = 0.005
 
 
 class BatchedSQLiteWriter:
@@ -47,25 +66,60 @@ class BatchedSQLiteWriter:
         path: str = SQLITE_PATH,
         batch_window_seconds: float = SQLITE_WRITER_BATCH_WINDOW_SECONDS,
         max_batch_size: int = SQLITE_WRITER_MAX_BATCH_SIZE,
+        max_queue_size: int = SQLITE_WRITER_QUEUE_MAX_SIZE,
+        max_priority_queue_size: int = SQLITE_WRITER_PRIORITY_QUEUE_MAX_SIZE,
     ) -> None:
         self._path = path
         self._batch_window_seconds = batch_window_seconds
         self._max_batch_size = max_batch_size
-        self._queue: "queue.Queue[_WriteJob | object]" = queue.Queue()
+        # Two independently-bounded lanes so a NORMAL-lane flood can never reject a priority
+        # (fall_warn) write with queue.Full -- see _get_next for how a single consumer thread
+        # drains both without polling-free blocking on two queues at once.
+        self._priority_queue: "queue.Queue[_WriteJob]" = queue.Queue(maxsize=max_priority_queue_size)
+        self._normal_queue: "queue.Queue[_WriteJob | object]" = queue.Queue(maxsize=max_queue_size)
         self._thread: threading.Thread | None = None
+        # Guards self._dead and self._thread together with enqueueing/thread-lifecycle reads so a
+        # submit() can never land a job after the writer has drained-and-failed everything on a
+        # crash, and stop()/the crash path can never race on self._thread (see submit()/_run()).
+        self._lock = threading.Lock()
+        # Set when _run exits on an unexpected (non-flush) fault, so submit() fails fast instead
+        # of silently queuing into a thread that will never drain it again.
+        self._dead = False
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, name="sqlite-writer", daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._dead = False
+            thread = threading.Thread(target=self._run, name="sqlite-writer", daemon=True)
+            self._thread = thread
+        thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        if self._thread is None:
-            return
-        self._queue.put(_STOP)
-        self._thread.join(timeout=timeout)
-        self._thread = None
+        with self._lock:
+            thread = self._thread
+            if thread is None:
+                return
+            # Reject any submit() racing with shutdown immediately -- closes the orphaned-future
+            # window entirely (rather than narrowing it) and bounds both lanes to a fixed,
+            # finite snapshot so _run is guaranteed to drain down to _STOP in bounded time.
+            self._dead = True
+        deadline = time.monotonic() + timeout
+        try:
+            # _STOP always goes on the NORMAL lane, never the priority lane: _get_next only
+            # returns it once normal_queue's turn comes up (after everything already ahead of it
+            # there, and only once priority_queue is empty), so nothing queued before stop() was
+            # called in EITHER lane is ever skipped past or orphaned.
+            self._normal_queue.put(_STOP, timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Full:
+            logger.warning("sqlite writer stop: normal queue still full, proceeding to join without STOP")
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            logger.warning("sqlite writer stop: thread did not exit within timeout, leaving it running")
+            return  # do NOT clear self._thread here -- start() must never spawn a second thread over a live one
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
 
     def submit(self, sql: str, params: tuple[Any, ...], *, priority: bool = False) -> "asyncio.Future[tuple[int, int | None]]":
         # Called from the event loop thread. The asyncio Future is resolved from the writer
@@ -74,20 +128,27 @@ class BatchedSQLiteWriter:
         loop = asyncio.get_running_loop()
         future: "asyncio.Future[tuple[int, int | None]]" = loop.create_future()
         job = _WriteJob(sql=sql, params=params, loop=loop, future=future, priority=priority)
-        self._queue.put(job)
+        with self._lock:
+            if self._dead:
+                future.set_exception(SQLiteWriterError("sqlite writer thread is not running"))
+                return future
+            try:
+                (self._priority_queue if priority else self._normal_queue).put_nowait(job)
+            except queue.Full:
+                future.set_exception(SQLiteWriterError("sqlite writer queue is full"))
         return future
 
     def _run(self) -> None:
         connection = get_db_connection(self._path)
         try:
             while True:
-                job = self._queue.get()
+                job = self._get_next(timeout=None)
                 if job is _STOP:
                     return
                 batch = [job]
                 # Priority jobs (fall_warn) never wait for the batch window -- alarm latency must
                 # not be taxed by NORMAL-lane batching. Opportunistically fold in whatever else is
-                # already queued (non-blocking) so a burst still amortizes its commit.
+                # already queued in EITHER lane (non-blocking) so a burst still amortizes its commit.
                 if isinstance(job, _WriteJob) and job.priority:
                     self._drain_ready(batch)
                 else:
@@ -98,13 +159,74 @@ class BatchedSQLiteWriter:
                     self._flush(connection, real_jobs)
                 if stop_requested:
                     return
+        except Exception:
+            # A fault here (as opposed to inside _flush's per-batch try/except) means the loop
+            # itself died -- e.g. a poisoned connection or an OS-level queue failure. Left
+            # unhandled, this thread would exit silently and every future submit() would enqueue
+            # into a queue nobody ever drains again, hanging callers forever. Fail everything
+            # still queued so callers get a fast, observable error, and mark the writer dead so
+            # new submissions reject immediately instead of queuing into the void. All done under
+            # the same lock submit()/stop() take, so neither can race this thread's own lifecycle
+            # bookkeeping (self._dead, self._thread).
+            logger.exception("sqlite writer thread crashed")
+            with self._lock:
+                self._dead = True
+                self._drain_and_fail_all()
+                # Allow a future start() to spin up a replacement thread instead of silently
+                # no-op'ing forever (start()'s guard only checks self._thread is None).
+                self._thread = None
         finally:
             connection.close()
+
+    def _get_next(self, timeout: float | None) -> Any:
+        # Always prefer the priority lane so a fall_warn write is never delayed behind NORMAL-lane
+        # backlog. Since these are two independent stdlib Queues (no single primitive can block on
+        # both at once), poll the normal lane in short slices -- see _PRIORITY_POLL_INTERVAL_SECONDS.
+        poll_interval = _PRIORITY_POLL_INTERVAL_SECONDS
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                return self._priority_queue.get_nowait()
+            except queue.Empty:
+                pass
+            wait_for = poll_interval
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                wait_for = min(poll_interval, remaining)
+            try:
+                return self._normal_queue.get(timeout=wait_for)
+            except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
+
+    def _get_nowait_either(self) -> Any:
+        # Unlike _get_next(timeout=0) -- whose deadline expires before the normal-lane check is
+        # ever reached -- this genuinely checks both lanes non-blocking, for callers (_drain_ready)
+        # that want to opportunistically fold in whatever is ready right now in either lane.
+        try:
+            return self._priority_queue.get_nowait()
+        except queue.Empty:
+            pass
+        return self._normal_queue.get_nowait()
+
+    def _drain_and_fail_all(self) -> None:
+        for lane in (self._priority_queue, self._normal_queue):
+            while True:
+                try:
+                    item = lane.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, _WriteJob):
+                    _safe_call_soon_threadsafe(
+                        item.loop, _fail_future, item.future, SQLiteWriterError("sqlite writer thread crashed")
+                    )
 
     def _drain_ready(self, batch: list[Any]) -> None:
         while len(batch) < self._max_batch_size:
             try:
-                item = self._queue.get_nowait()
+                item = self._get_nowait_either()
             except queue.Empty:
                 break
             batch.append(item)
@@ -118,7 +240,7 @@ class BatchedSQLiteWriter:
             if remaining <= 0:
                 break
             try:
-                item = self._queue.get(timeout=remaining)
+                item = self._get_next(timeout=remaining)
             except queue.Empty:
                 break
             batch.append(item)
@@ -136,10 +258,22 @@ class BatchedSQLiteWriter:
         except Exception as exc:  # noqa: BLE001 -- must propagate to every waiter, not swallow
             connection.rollback()
             for job in jobs:
-                job.loop.call_soon_threadsafe(_fail_future, job.future, exc)
+                _safe_call_soon_threadsafe(job.loop, _fail_future, job.future, exc)
             return
         for job in jobs:
-            job.loop.call_soon_threadsafe(_resolve_future, job.future, (job.rowcount, job.lastrowid))
+            _safe_call_soon_threadsafe(job.loop, _resolve_future, job.future, (job.rowcount, job.lastrowid))
+
+
+def _safe_call_soon_threadsafe(loop: asyncio.AbstractEventLoop, callback: Any, *args: Any) -> None:
+    # A caller's loop can already be closed (e.g. request cancelled/disconnected) by the time the
+    # writer thread tries to resolve its future. That must only drop this one job's result, not
+    # look like a fault in the writer loop itself -- callers of this helper are on the writer's
+    # hot path (_flush, _drain_and_fail_all) and must never let one stale loop escalate into the
+    # outer except in _run(), which would wrongly treat it as a full writer crash.
+    try:
+        loop.call_soon_threadsafe(callback, *args)
+    except RuntimeError:
+        logger.warning("sqlite writer: target event loop is closed, dropping result")
 
 
 def _resolve_future(future: "asyncio.Future[tuple[int, int | None]]", result: tuple[int, int | None]) -> None:

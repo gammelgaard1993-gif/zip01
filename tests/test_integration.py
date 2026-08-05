@@ -309,7 +309,7 @@ class OfflineReplayOccupancyTests(unittest.IsolatedAsyncioTestCase):
         await handler.handle(exit_event)
         await handler.handle(enter)
 
-        response = await room_occupancy("room_off", window="1h", redis_client=cast(Any, redis_client))
+        response = await room_occupancy("room_off", window="1h", redis_client=cast(Any, redis_client), redis_executor=None)
 
         # 20 occupied minutes within a 60-minute window => ~0.333.
         self.assertAlmostEqual(response.occupied_pct, 20.0 / 60.0, delta=0.02)

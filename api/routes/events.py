@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request, Response
 
 import config
 from core.event_log import persist_validated_event, persist_validated_event_async
+from core.db_writer import SQLiteWriterError
 from core.metrics import increment_counter
 from ingestion.queue import PriorityEventQueue
 from ingestion.validator import ValidationError, validate_raw_event
@@ -116,7 +117,7 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
             await persist_validated_event_async(sqlite_writer, validated)
         else:
             persist_validated_event(db_connection, validated)
-    except sqlite3.Error:
+    except (sqlite3.Error, SQLiteWriterError) as exc:
         increment_counter("events_persist_failed")
         logger.error(
             json.dumps(
@@ -124,6 +125,7 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
                     "event": "persist_failed",
                     "device_id": validated.device_id,
                     "type": validated.type,
+                    "reason": "writer_unavailable" if isinstance(exc, SQLiteWriterError) else "sqlite_error",
                 }
             )
         )

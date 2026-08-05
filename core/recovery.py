@@ -9,7 +9,7 @@ from time import perf_counter
 from sqlite3 import Connection
 from typing import Any, Callable, Iterable, Protocol, TypedDict, cast
 
-from config import STATE_SNAPSHOT_INTERVAL_SECONDS
+from config import STATE_SNAPSHOT_INTERVAL_SECONDS, STATE_SNAPSHOT_RETENTION_COUNT
 from ingestion.validator import ValidationError
 from models import Priority, ValidatedEvent
 from processing.alarm_bus import AlarmBus
@@ -201,6 +201,13 @@ class RecoveryManager:
         cursor.execute(
             "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
             (snapshot_ts, state_json),
+        )
+        # Only the newest row is ever read back (see _load_latest_snapshot), so prune older ones
+        # on every insert instead of letting the table grow unbounded over a long-running deploy.
+        cursor.execute(
+            "DELETE FROM state_snapshots WHERE id NOT IN "
+            "(SELECT id FROM state_snapshots ORDER BY id DESC LIMIT ?)",
+            (STATE_SNAPSHOT_RETENTION_COUNT,),
         )
         self.db_connection.commit()
 

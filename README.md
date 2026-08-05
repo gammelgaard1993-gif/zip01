@@ -4,7 +4,8 @@ Real-time streaming backend for sensor events with prioritized processing, Redis
 
 ## Quickstart
 
-Requires Docker (for Mosquitto + Redis) and Python 3.12+.
+Requires Redis (via Docker or a native install) and Python 3.12+. Mosquitto/Docker is
+only needed if you enable the optional MQTT ingestion path (`ENABLE_MQTT=True`).
 
 ```bash
 make deps     # install pinned dependencies
@@ -14,7 +15,7 @@ make run      # start Mosquitto + Redis (Docker) and the service on :8080
 In a second shell, drive load and inspect the API:
 
 ```bash
-make test                 # 37 unit + integration tests
+make test                 # unit + integration tests
 make smoke                # quick end-to-end check (service must be running)
 DEVICES=500 make burst    # 10x burst — verify no drops + alarm p95 <= 1s
 make offline              # offline device replays a 20-min backlog of late events

@@ -64,7 +64,7 @@ class OccupancyRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_returns_zero_when_room_has_no_presence(self) -> None:
         redis_client = FakeRedis()
 
-        response = await room_occupancy("room_empty", window="1m", redis_client=cast(Any, redis_client))
+        response = await room_occupancy("room_empty", window="1m", redis_client=cast(Any, redis_client), redis_executor=None)
 
         self.assertFalse(response.in_room)
         self.assertEqual(response.occupied_pct, 0.0)
@@ -84,7 +84,7 @@ class OccupancyRouteTests(unittest.IsolatedAsyncioTestCase):
         redis_client.zadd(key, {exit_payload: exit_ts.timestamp()})
         redis_client.hset("room:room_1:presence", {"in_room": "false", "ts": exit_ts.isoformat()})
 
-        response = await room_occupancy("room_1", window="1m", redis_client=cast(Any, redis_client))
+        response = await room_occupancy("room_1", window="1m", redis_client=cast(Any, redis_client), redis_executor=None)
 
         self.assertFalse(response.in_room)
         self.assertAlmostEqual(response.occupied_pct, 0.5, delta=0.08)
@@ -206,7 +206,7 @@ class OccupancyInitialStateRecoveryTests(unittest.IsolatedAsyncioTestCase):
         # The anchor transition must survive the trim instead of being deleted as pre-cutoff.
         self.assertEqual(len(redis.zsets["room:room_1:occupancy"]), 1)
 
-        response = await room_occupancy("room_1", window="1h", redis_client=cast(Any, redis))
+        response = await room_occupancy("room_1", window="1h", redis_client=cast(Any, redis), redis_executor=None)
 
         self.assertTrue(response.in_room)
         self.assertAlmostEqual(response.occupied_pct, 1.0, delta=0.01)

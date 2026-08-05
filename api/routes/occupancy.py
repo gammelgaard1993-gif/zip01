@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 from typing import Protocol, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from api.dependencies import get_redis_client
+from api.dependencies import get_redis_client, get_redis_executor
 from redis import Redis
 
 router = APIRouter()
@@ -72,19 +74,15 @@ class RoomOccupancyResponse(BaseModel):
     window_seconds: int
 
 
-@router.get("/rooms/{room_id}/occupancy", response_model=RoomOccupancyResponse)
-async def room_occupancy(
-    room_id: str,
-    window: str = Query("5m"),
-    redis_client: Redis = Depends(get_redis_client),
-) -> RoomOccupancyResponse:
-    occupancy_redis = cast(_OccupancyRedisReader, redis_client)
-    duration = parse_window(window)
-    now = datetime.now(timezone.utc).timestamp()
+def _read_occupancy_state(
+    occupancy_redis: _OccupancyRedisReader, room_id: str, duration: int, now: float
+) -> tuple[list[dict[str, object]], bool, bool]:
+    # Bundled into one function so the three blocking Redis round-trips make a single hop to the
+    # executor thread instead of three, keeping the event loop responsive under load.
     transitions_key = f"room:{room_id}:occupancy"
 
-    transitions = occupancy_redis.zrangebyscore(transitions_key, now - duration, now, withscores=False)
-    normalized_transitions = [_as_text(item) for item in transitions]
+    raw_transitions = occupancy_redis.zrangebyscore(transitions_key, now - duration, now, withscores=False)
+    normalized_transitions = [_as_text(item) for item in raw_transitions]
     transitions = [json.loads(item) for item in normalized_transitions]
     transitions.sort(key=lambda item: datetime.fromisoformat(item["ts"]))
 
@@ -103,6 +101,30 @@ async def room_occupancy(
         current_occupancy = bool(json.loads(in_room_text))
     else:
         current_occupancy = False
+
+    return transitions, initial_state, current_occupancy
+
+
+@router.get("/rooms/{room_id}/occupancy", response_model=RoomOccupancyResponse)
+async def room_occupancy(
+    room_id: str,
+    window: str = Query("5m"),
+    redis_client: Redis = Depends(get_redis_client),
+    redis_executor: Executor | None = Depends(get_redis_executor),
+) -> RoomOccupancyResponse:
+    occupancy_redis = cast(_OccupancyRedisReader, redis_client)
+    duration = parse_window(window)
+    now = datetime.now(timezone.utc).timestamp()
+
+    if redis_executor is not None:
+        loop = asyncio.get_running_loop()
+        transitions, initial_state, current_occupancy = await loop.run_in_executor(
+            redis_executor, _read_occupancy_state, occupancy_redis, room_id, duration, now
+        )
+    else:
+        transitions, initial_state, current_occupancy = _read_occupancy_state(
+            occupancy_redis, room_id, duration, now
+        )
 
     occupied_seconds = 0.0
     previous_ts = now - duration
