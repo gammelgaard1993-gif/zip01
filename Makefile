@@ -1,7 +1,7 @@
 # Teton backend — developer & grader entrypoints.
 #
-# `make run` is the single command that brings up Mosquitto + Redis (via Docker)
-# and starts the service. The other targets drive the event generator / test suite.
+# `make run` is the single command that brings up Redis (via Docker) and starts the service.
+# The other targets drive the event generator / test suite.
 #
 # Windows note: `make`/`docker` may not be installed. Equivalent PowerShell
 # commands are documented in README.md ("Running on Windows").
@@ -25,13 +25,13 @@ deps: ## Install pinned Python dependencies
 	$(PYTHON) -m pip install -r requirements.txt
 
 .PHONY: infra-up
-infra-up: ## Start Mosquitto + Redis (detached)
+infra-up: ## Start Redis (detached)
 	$(COMPOSE) up -d
-	@echo "waiting for redis + mosquitto health..."
+	@echo "waiting for redis health..."
 	@$(COMPOSE) ps
 
 .PHONY: infra-down
-infra-down: ## Stop Mosquitto + Redis
+infra-down: ## Stop Redis
 	$(COMPOSE) down
 
 .PHONY: serve
@@ -71,4 +71,3 @@ adversarial: ## Burst + offline + clock skew combined — full stress scenario (
 	$(PYTHON) event_generator/generate.py --mode adversarial --target $(API) --devices $(DEVICES) --duration 120 --rps-per-device $(RPS)
 	@sleep 2
 	@echo "--- /metrics ---"; curl -s $(API)/metrics
-

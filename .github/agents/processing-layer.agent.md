@@ -21,10 +21,10 @@ Maintain correct, deterministic event processing from queued event to handler ou
 - Processing-side routing, handler idempotency expectations, and alarm emission semantics
 
 ## Does Not Own
-- MQTT ingest/validation/ack mechanics (`ingestion/*`)
+- Ingestion validation and queue mechanics (`ingestion/*`)
 - Persistence/recovery infrastructure design (`core/*`)
 - API route contracts and response schemas (`api/*`)
-- Broker config tuning (`mosquitto/*`)
+- Broker/config tuning when relevant
 
 Escalate cross-layer dependencies with evidence.
 

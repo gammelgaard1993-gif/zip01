@@ -78,7 +78,7 @@ def parse_iso_timestamp(value: str) -> datetime:
 
 
 def validate_raw_event(raw: Any) -> ValidatedEvent:
-    # Untrusted MQTT input: every field is type-checked here so malformed events become clean
+    # Untrusted input: every field is type-checked here so malformed events become clean
     # ValidationErrors (rejected + acked) rather than exceptions escaping onto the paho thread.
     if not isinstance(raw, dict):
         raise ValidationError("raw event must be a JSON object", reason="invalid_schema")

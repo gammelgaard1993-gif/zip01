@@ -52,7 +52,7 @@ class WorkerPool:
         self.router_tasks: List[asyncio.Task[None]] = []
         self.flush_tasks: set[asyncio.Task[None]] = set()
         self.reorder_buffer_seconds = DEVICE_REORDER_BUFFER_MS / 1000.0
-        # In-flight received_at multiset: an event is registered at admission (HTTP route / MQTT)
+        # In-flight received_at multiset: an event is registered at admission
         # and deregistered once its handler runs. The oldest entry is the snapshot replay cutoff,
         # so an event still queued/buffered during a snapshot capture is never excluded from
         # recovery replay.
@@ -194,10 +194,9 @@ class WorkerPool:
                 # Re-sort on each iteration: an event may have been appended during the await above.
                 device_events.sort(key=lambda item: item.ts)
                 next_event = device_events.pop(0)
-                # Durability already happened at admission: the /events route and the MQTT enqueue
-                # path persist the event to SQLite before acknowledging it. The worker owns only the
-                # derived hot state, so a handler failure here is isolated and never risks the
-                # durable record.
+                # Durability already happened at admission: the /events route persists the event
+                # to SQLite before the worker runs. The worker owns only the derived hot state, so
+                # a handler failure here is isolated and never risks the durable record.
                 handler = handlers.get(next_event.type, handlers["motion"])
                 try:
                     await handler.handle(next_event)

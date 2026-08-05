@@ -5,7 +5,7 @@
 zip01 is a layered backend for high-volume sensor events.
 
 1. HTTP ingestion (`POST /events`) receives device events; the reference generator posts one
-   flat JSON event per request. An MQTT subscriber is an optional secondary path (off by default).
+   flat JSON event per request.
 2. Validation enforces schema and clock-skew constraints.
 3. A two-lane in-process queue prioritizes `fall_warn` events.
 4. A worker pool routes events to type-specific handlers by device.
@@ -23,28 +23,25 @@ App initialization (`api/app.py`) creates shared singletons on `app.state`:
 - `alarm_bus` (in-memory pub/sub)
 - `event_queue` (high + normal lanes)
 - `worker_pool`
-- `mqtt_subscriber` (only when `ENABLE_MQTT=True`; otherwise `None`)
 - `recovery_manager`
 
 Startup sequence:
 
 1. Initialize DB and Redis clients.
-2. Create alarm bus, queue, and worker pool; create the MQTT subscriber only if `ENABLE_MQTT`.
+2. Create alarm bus, queue, and worker pool.
 3. Run state restoration (`restore_state`).
 4. Start periodic snapshots.
-5. Start the MQTT subscription thread if enabled.
-6. Start async worker pool.
+5. Start async worker pool.
 
-The primary ingestion path is the `POST /events` route, always active regardless of MQTT.
+The primary ingestion path is the `POST /events` route, always active.
 
 Shutdown sequence:
 
-1. Stop the MQTT client loop (if running).
-2. Gracefully drain the worker pool: let the router move the global queue into worker lanes and
+1. Gracefully drain the worker pool: let the router move the global queue into worker lanes and
    let workers finish buffered flushes, bounded by a timeout (enqueued events are already durable,
    so anything left at the deadline is replayed on restart).
-3. Stop the snapshot loop and write a final snapshot of the drained hot state.
-4. Close SQLite connection.
+2. Stop the snapshot loop and write a final snapshot of the drained hot state.
+3. Close SQLite connection.
 
 ## Component Responsibilities
 
@@ -63,14 +60,6 @@ Shutdown sequence:
     await, delaying the `202` instead of dropping the event. HIGH `fall_warn` returns immediately
     under normal/burst load; only a saturated HIGH lane (`HIGH_QUEUE_MAX_SIZE`) backpressures, and
     it never drops `fall_warn`.
-
-- `ingestion.mqtt_subscriber.MQTTSubscriber` (optional secondary transport, off by default)
-  - Subscribes to `teton/devices/+/events` at QoS 1.
-  - Decodes JSON payload.
-  - Validates event shape and timestamp constraints.
-  - Enqueues validated events to high or normal lane.
-  - Enqueues without blocking the single MQTT delivery thread, so a saturated NORMAL lane never
-    stalls HIGH `fall_warn` delivery; backpressure pauses NORMAL and never drops.
 
 - `ingestion.validator.validate_raw_event`
   - Verifies required keys and value types.
@@ -102,7 +91,7 @@ Shutdown sequence:
     dropped). Correctness of derived state is preserved by ts-aware, idempotent handlers rather
     than by strict apply order (see `tests/test_ordering.py`).
   - Runs hot-state handlers only; durability is owned by admission (the event is persisted to
-    SQLite before the `202`/MQTT ack), so a handler failure never risks the durable record.
+    SQLite before the `202` response), so a handler failure never risks the durable record.
   - Isolates handler failures (logs exception and continues).
 
 - Handlers (`processing/handlers/*`)

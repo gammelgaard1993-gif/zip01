@@ -1,6 +1,6 @@
-# Local infrastructure for the Teton backend: Redis (hot state) + Mosquitto (MQTT).
-# The service itself runs on the host (uvicorn) and connects to these on localhost,
-# matching the defaults in config.py (REDIS_URL / MQTT_BROKER_URL).
+# Local infrastructure for the Teton backend: Redis (hot state).
+# The service itself runs on the host (uvicorn) and connects to Redis on localhost,
+# matching the default in config.py (REDIS_URL).
 
 services:
   redis:
@@ -18,22 +18,3 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-
-  mosquitto:
-    image: eclipse-mosquitto:2
-    container_name: teton-mosquitto
-    ports:
-      - "127.0.0.1:1883:1883"
-    volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      # Back the persistence_location (mosquitto.conf) with a named volume so the
-      # on-disk QoS 1 state survives container recreation, not just restarts.
-      - mosquitto-data:/mosquitto/data
-    healthcheck:
-      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -W 3 -q 1 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  mosquitto-data:

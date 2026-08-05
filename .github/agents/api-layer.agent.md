@@ -20,7 +20,7 @@ Deliver correct, stable FastAPI behavior for read APIs and streaming APIs withou
 - API-side request/response models and dependency wiring
 
 ## Does Not Own
-- MQTT ingestion behavior (`ingestion/*`)
+- HTTP ingestion behavior (`ingestion/*`)
 - Processing logic, dedup, and alarm production (`processing/*`)
 - Persistence internals and recovery mechanics (`core/*`)
 

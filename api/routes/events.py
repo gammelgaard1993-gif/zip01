@@ -21,10 +21,9 @@ router = APIRouter()
 
 @router.post("/events")
 async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
-    # the reference generator POSTs one flat JSON event per request. This route
-    # mirrors the MQTT subscriber's validate -> enqueue path, using the HTTP response as the
-    # backpressure signal (a full NORMAL lane makes event_queue.put await, delaying the reply
-    # instead of dropping the event).
+    # the reference generator POSTs one flat JSON event per request. This route uses the HTTP
+    # response as the backpressure signal (a full NORMAL lane makes event_queue.put await,
+    # delaying the reply instead of dropping the event).
     increment_counter("events_ingested_total")
 
     # 0) Bound per-request memory. Reject an oversized body before buffering/parsing it: check the

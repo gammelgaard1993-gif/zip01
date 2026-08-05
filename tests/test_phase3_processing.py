@@ -300,7 +300,7 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(alarm_bus.published), 1)
 
     async def test_generic_event_types_persist_via_admission(self) -> None:
-        # Durability now happens at admission (the /events route and MQTT enqueue call
+        # Durability now happens at admission (the /events route persisting before enqueue
         # persist_validated_event before ack), not in the worker. Every event type lands in the
         # durable `events` log via that path.
         from core.event_log import persist_validated_event

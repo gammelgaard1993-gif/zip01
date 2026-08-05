@@ -18,7 +18,6 @@ The service starts in FastAPI lifespan and wires:
 - Redis via `core.redis_client.get_redis_client()`
 - In-memory priority queue via `ingestion.queue.PriorityEventQueue`
 - HTTP ingestion (primary) via `api.routes.events` (`POST /events`)
-- MQTT ingestion (optional, off by default — `ENABLE_MQTT=False`) via `ingestion.mqtt_subscriber.MQTTSubscriber`
 - Workers via `processing.worker_pool.WorkerPool`
 - Alarm fan-out via `processing.alarm_bus.AlarmBus`
 - Recovery and snapshots via `core.recovery.RecoveryManager`

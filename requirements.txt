@@ -1,4 +1,3 @@
 fastapi==0.138.2
 uvicorn==0.49.0
-paho-mqtt==2.1.0
 redis==8.0.1

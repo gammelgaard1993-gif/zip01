@@ -34,7 +34,7 @@ At least one of:
 Cover the applicable categories for the requested scope:
 - **Injection**: SQL/NoSQL/command/template. Confirm every DB query binds parameters (`?` placeholders) vs interpolates (f-string/format/`%`/concat). Check Redis key/arg construction and any `eval`/`exec`/`subprocess`/shell usage.
 - **Broken auth / access control**: missing authn/authz on endpoints, unauthenticated write/ingest paths, IDOR on path params.
-- **Security misconfiguration**: services bound to `0.0.0.0`, missing passwords/TLS (Redis, MQTT), `allow_anonymous`, published container ports, `debug=True`, permissive CORS, image pinning, restart/resource limits.
+- **Security misconfiguration**: services bound to `0.0.0.0`, missing passwords/TLS on brokers, `allow_anonymous`, published container ports, `debug=True`, permissive CORS, image pinning, restart/resource limits.
 - **Sensitive data exposure**: hardcoded secrets/credentials/tokens in source, PII in logs/responses, plaintext transport, file permissions on durable stores.
 - **Security logging & error handling**: stack traces or raw exception text in responses, unhandled paths that 500, reflected input in errors, broad `except` that swallows failures silently, missing audit signal.
 - **Vulnerable/outdated components**: dependency versions and known-risky patterns.

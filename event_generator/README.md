@@ -15,7 +15,7 @@ adversarial , combination of the above plus random clock skew
 
 ## Transport
 
-Configurable; defaults to HTTP POST to `http://localhost:8080/events`. WebSocket and MQTT modes are also planned.
+Configurable; defaults to HTTP POST to `http://localhost:8080/events`. WebSocket modes are also planned.
 
 ## Event schema
 

@@ -4,8 +4,7 @@
 
 ### 1) Ingestion
 
-- `POST /events` receives one flat JSON event per request (primary path); the optional MQTT
-  subscriber feeds the same validator + queue when `ENABLE_MQTT=True`.
+- `POST /events` receives one flat JSON event per request (primary path).
 - Oversized bodies are rejected with `413` (`{"error": "payload_too_large"}`, counted
   `events_rejected_too_large`) before JSON parsing/validation: the declared `Content-Length` is
   checked as a fast path, then the body is read incrementally (`request.stream()`), aborting as
@@ -25,8 +24,8 @@
 - Schema failures return `400`; clock-skew rejections return `202` with
   `{"status": "rejected", "reason": ...}`.
 - Persist-before-ack: a validated event is written to the durable SQLite `events` log **before**
-  the `202` (and, on the MQTT path, before the puback), so an acknowledged event survives a crash
-  even though its hot-state handler runs later. A storage error returns `503`
+  the `202`, so an acknowledged event survives a crash even though its hot-state handler runs
+  later. A storage error returns `503`
   (`{"error": "persist_failed"}`, counted `events_persist_failed`) and the event is neither
   enqueued nor acknowledged, so the client can retry (no false accept, no silent loss).
 
@@ -40,8 +39,6 @@
   delayed until capacity frees up; the event is never dropped. A full lane also increments
   `queue_pressure`. HIGH `fall_warn` is not stalled behind NORMAL (no priority inversion); a
   saturated HIGH lane backpressures rather than dropping.
-- On the optional MQTT path, the same full lane pauses NORMAL delivery without blocking the
-  MQTT thread, so HIGH `fall_warn` keeps flowing.
 
 ### 3) Worker Routing and Ordering
 
@@ -140,8 +137,8 @@ For each flushed event:
 
 - Invalid JSON/schema: reject event, increment reject counters.
 - Clock skew outside +/-1 hour: reject as skew.
-- Queue saturation: the `POST /events` response is delayed (or the optional MQTT NORMAL delivery
-  is paused) instead of dropping; HIGH `fall_warn` events keep flowing.
+- Queue saturation: the `POST /events` response is delayed instead of dropping; HIGH `fall_warn`
+  events keep flowing.
 - Worker handler exception: event loop continues.
 - Duplicate fall alarm in dedup window: suppressed.
 - Redis cold start with warm SQLite: recovery reconstructs managed hot state.
