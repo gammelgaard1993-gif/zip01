@@ -7,7 +7,7 @@ from concurrent.futures import Executor
 from sqlite3 import Connection
 from typing import TYPE_CHECKING, Dict, List
 
-from config import DEVICE_REORDER_BUFFER_MS, WORKER_COUNT, WORKER_NORMAL_QUEUE_MAX_SIZE
+from config import DEVICE_REORDER_BUFFER_MS, ROUTER_TASK_COUNT, WORKER_COUNT, WORKER_NORMAL_QUEUE_MAX_SIZE
 from ingestion.queue import PriorityEventQueue
 from models import ValidatedEvent
 from processing.handlers.base import EventHandler
@@ -49,7 +49,7 @@ class WorkerPool:
             PriorityEventQueue(WORKER_NORMAL_QUEUE_MAX_SIZE) for _ in range(WORKER_COUNT)
         ]
         self.workers: List[asyncio.Task[None]] = []
-        self.router_task: asyncio.Task[None] | None = None
+        self.router_tasks: List[asyncio.Task[None]] = []
         self.flush_tasks: set[asyncio.Task[None]] = set()
         self.reorder_buffer_seconds = DEVICE_REORDER_BUFFER_MS / 1000.0
         # In-flight received_at multiset: an event is registered at admission (HTTP route / MQTT)
@@ -78,7 +78,7 @@ class WorkerPool:
 
     async def start(self) -> None:
         self.workers = [asyncio.create_task(self._worker_loop(index, queue)) for index, queue in enumerate(self.worker_queues)]
-        self.router_task = asyncio.create_task(self._router_loop())
+        self.router_tasks = [asyncio.create_task(self._router_loop()) for _ in range(ROUTER_TASK_COUNT)]
 
     async def stop(self, drain: bool = True, drain_timeout: float = 2.0) -> None:
         # Graceful drain: enqueued events are already durable (persisted at admission), so draining
@@ -101,18 +101,23 @@ class WorkerPool:
                 if not lanes_pending and not self.flush_tasks:
                     break
                 await asyncio.sleep(0.02)
-        if self.router_task:
-            self.router_task.cancel()
+        for router_task in self.router_tasks:
+            router_task.cancel()
         for worker in self.workers:
             worker.cancel()
         for flush_task in list(self.flush_tasks):
             flush_task.cancel()
+        await asyncio.gather(*(t for t in self.router_tasks if not t.done()), return_exceptions=True)
         await asyncio.gather(*(t for t in self.workers if not t.done()), return_exceptions=True)
         await asyncio.gather(*(t for t in self.flush_tasks if not t.done()), return_exceptions=True)
 
     async def _router_loop(self) -> None:
-        # Single consumer of the priority queue. It only routes (never handles) so the HIGH lane
-        # can drain as fast as events arrive; all blocking work happens on the worker tasks.
+        # One of ROUTER_TASK_COUNT peer consumers of the shared priority queue, so one congested
+        # worker queue can't head-of-line-block routing to the rest. Concurrent put()s into the
+        # same worker queue need no ordering coordination: per-device processing order is decided
+        # by each event's own ts field (re-sorted in the worker pool), not by put() arrival order
+        # -- the only exception is a tie-break among equal-ts events, which becomes nondeterministic
+        # across router tasks instead of FIFO; this is permitted since ts is the sole ordering key.
         while True:
             event = await self.event_queue.get()
             index = self._worker_index(event.device_id)

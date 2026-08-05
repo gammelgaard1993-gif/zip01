@@ -35,6 +35,12 @@ WORKER_COUNT = 8
 # so a full worker NORMAL lane backpressures the router (and in turn the HTTP/MQTT ingress)
 # instead of growing an unbounded downstream FIFO. HIGH uses HIGH_QUEUE_MAX_SIZE per worker.
 WORKER_NORMAL_QUEUE_MAX_SIZE = 100_000
+# Small pool of router tasks sharing the global queue, instead of a single router task, so one
+# congested worker's queue can't head-of-line-block routing to the rest. Raises (does not
+# eliminate) the stall threshold: routing only stalls fully if >= ROUTER_TASK_COUNT workers are
+# congested at once. No cross-task ordering coordination is needed: per-device processing order
+# is decided by each event's own ts field (re-sorted in the worker pool), not by put() order.
+ROUTER_TASK_COUNT = 4
 # Two sequential reorder stages (per-device in the worker pool, per-room in the alarm bus)
 # sit on the alarm hot path. Keep each at 100ms so the cumulative reorder budget stays well
 # under the 1s p95 alarm-delivery target, even with queue draining + handler time on top.

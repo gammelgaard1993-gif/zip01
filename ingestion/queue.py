@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from config import HIGH_QUEUE_MAX_SIZE
 from models import Priority, ValidatedEvent
+
+logger = logging.getLogger(__name__)
 
 class PriorityEventQueue:
     def __init__(self, normal_max_size: int) -> None:
@@ -53,8 +56,19 @@ class PriorityEventQueue:
                 {high_getter, normal_getter}, return_when=asyncio.FIRST_COMPLETED
             )
         except asyncio.CancelledError:
-            high_getter.cancel()
-            normal_getter.cancel()
+            # A getter may have already completed (item removed from its lane) before this outer
+            # await was cancelled; cancel() on a done task is a no-op, so without putting the item
+            # back it would be silently lost. The lane may have been refilled to capacity in the
+            # window since the getter completed, so put_nowait can raise -- log and drop rather
+            # than crash the caller with an unrelated QueueFull during cancellation.
+            for getter, lane in ((high_getter, self.high_queue), (normal_getter, self.normal_queue)):
+                if getter.done() and not getter.cancelled() and getter.exception() is None:
+                    try:
+                        lane.put_nowait(getter.result())
+                    except asyncio.QueueFull:
+                        logger.warning("priority queue get() cancelled: lane full, dropping recovered item")
+                else:
+                    getter.cancel()
             raise
 
         # Cancelling a pending asyncio.Queue.get() leaves the (absent) item untouched, so the
