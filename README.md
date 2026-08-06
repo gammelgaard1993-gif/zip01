@@ -1,4 +1,4 @@
-# zip01
+﻿# zip01
 
 Real-time streaming backend for sensor events with prioritized processing, Redis hot state, SQLite durability, and FastAPI APIs.
 
@@ -16,7 +16,7 @@ In a second shell, drive load and inspect the API:
 ```bash
 make test                 # unit + integration tests
 make smoke                # quick end-to-end check (service must be running)
-DEVICES=500 make burst    # 10x burst — verify no drops + alarm p95 <= 1s
+DEVICES=500 make burst    # 10x burst â€” verify no drops + alarm p95 <= 1s
 make offline              # offline device replays a 20-min backlog of late events
 ```
 
@@ -40,6 +40,17 @@ The service connects to `localhost:6379` (Redis, required) by default and listen
 HTTP `POST /events` is the primary transport (what the reference generator
 [event_generator/generate.py](event_generator/generate.py) posts to).
 
+## AI Collaboration Template (v1)
+
+This repository includes a lightweight v1 collaboration template under .github/ for GitHub/Copilot customization:
+
+- .github/copilot-instructions.md: shared baseline context and collaboration precedence.
+- .github/.mcp.json: shared MCP integration scaffolding.
+- .github/settings.json: default tool/model safety settings.
+- .github/instructions/*.instructions.md: scoped rules with path targeting.
+- .github/prompts/*.prompt.md: explicit reusable command-style workflows.
+- .github/agents/: native custom agents for reusable workflows and specialist roles.
+- .github/hooks/: pre/post tool guardrail scripts (invoked by your selected runner).
 ## Documentation
 
 Project documentation is available in the docs folder:
@@ -50,3 +61,4 @@ Project documentation is available in the docs folder:
 - [Critical Functions](docs/critical-functions.md)
 - [API Reference](docs/api-reference.md)
 - [Storage and Recovery](docs/storage-recovery.md)
+

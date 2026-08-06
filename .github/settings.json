@@ -1,0 +1,17 @@
+{
+  "model": "claude-sonnet-5",
+  "toolAccess": {
+    "denyCommands": [
+      "git reset --hard",
+      "git checkout --",
+      "git clean -fd"
+    ]
+  },
+  "defaults": {
+    "runCommand": "python main.py",
+    "testCommand": "python -m unittest discover -s tests -v"
+  },
+  "overrides": {
+    "localFile": "settings.local.json"
+  }
+}
