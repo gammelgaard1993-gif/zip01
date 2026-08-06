@@ -9,6 +9,7 @@ This folder contains project documentation for the zip01 real-time streaming bac
 - [Critical Functions](critical-functions.md): high-impact functions, inputs/outputs, side effects, and failure behavior.
 - [API Reference](api-reference.md): endpoint behavior and response contracts.
 - [Storage and Recovery](storage-recovery.md): Redis/SQLite roles, schema, snapshots, and replay behavior.
+- [Testing Structure](testing-structure.md): project-level test layering, shared helpers, and CI split guidance.
 
 ## Implementation Snapshot
 

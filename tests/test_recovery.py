@@ -4,90 +4,17 @@ import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
-from fnmatch import fnmatch
 from typing import Any, cast
 
 from core.recovery import RecoveryManager, SnapshotState
+from tests.fakes import FakeRedis as SharedFakeRedis
+
+FakeRedis = SharedFakeRedis
 
 
 class FakeAlarmBus:
     async def publish(self, alarm: object) -> None:
         return None
-
-
-class FakeRedis:
-    def __init__(self) -> None:
-        self.strings: dict[str, str] = {}
-        self.hashes: dict[str, dict[str, str]] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
-
-    def keys(self, pattern: str) -> list[str]:
-        keys: list[str] = []
-        keys.extend([key for key in self.strings if fnmatch(key, pattern)])
-        keys.extend([key for key in self.hashes if fnmatch(key, pattern)])
-        keys.extend([key for key in self.zsets if fnmatch(key, pattern)])
-        return keys
-
-    def scan_iter(self, match: str, count: int = 100) -> list[str]:
-        return self.keys(match)
-
-    def type(self, name: str) -> str:
-        if name in self.strings:
-            return "string"
-        if name in self.hashes:
-            return "hash"
-        if name in self.zsets:
-            return "zset"
-        return "none"
-
-    def get(self, name: str) -> str | None:
-        return self.strings.get(name)
-
-    def hgetall(self, name: str) -> dict[str, str]:
-        return dict(self.hashes.get(name, {}))
-
-    def zrange(self, name: str, start: int, end: int, withscores: bool = False) -> list[tuple[str, float]]:
-        entries = sorted(self.zsets.get(name, {}).items(), key=lambda item: item[1])
-        return entries
-
-    def zrevrangebyscore(
-        self, name: str, max: float | str, min: float | str, start: int = 0, num: int = 0, withscores: bool = False
-    ) -> list[tuple[str, float]]:
-        lo = float("-inf") if min == "-inf" else float(min)
-        hi = float("inf") if max == "+inf" else float(max)
-        entries = sorted(
-            ((member, score) for member, score in self.zsets.get(name, {}).items() if lo <= score <= hi),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        return entries[start : start + num] if num else entries[start:]
-
-    def set(self, name: str, value: str) -> object:
-        self.strings[name] = value
-        return True
-
-    def hset(self, name: str, mapping: dict[str, str]) -> object:
-        self.hashes[name] = dict(mapping)
-        return True
-
-    def zadd(self, name: str, mapping: dict[str, float]) -> object:
-        zset = self.zsets.setdefault(name, {})
-        zset.update(mapping)
-        return True
-
-    def delete(self, *names: str) -> int:
-        removed = 0
-        for name in names:
-            if name in self.strings:
-                del self.strings[name]
-                removed += 1
-            if name in self.hashes:
-                del self.hashes[name]
-                removed += 1
-            if name in self.zsets:
-                del self.zsets[name]
-                removed += 1
-        return removed
 
 
 class _FakePipeline:
@@ -132,7 +59,7 @@ class _FakePipeline:
         return None
 
 
-class PipelineFakeRedis(FakeRedis):
+class PipelineFakeRedis(SharedFakeRedis):
     def get(self, name: str) -> str | None:
         return self.strings.get(name)
 
@@ -170,7 +97,7 @@ class _ReadPipeline:
         return results
 
 
-class CaptureFakeRedis(FakeRedis):
+class CaptureFakeRedis(SharedFakeRedis):
     def get(self, name: str) -> str | None:
         return self.strings.get(name)
 

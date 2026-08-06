@@ -13,9 +13,22 @@ applyTo: 'tests/**/*.py'
 ## Test Organization
 
 **Implementation**:
-- File structure mirrors code: `tests/test_api.py`, `tests/test_core.py`, etc.
+- File structure mirrors behavior layers and code boundaries. Keep the narrowest useful scope for the behavior being tested.
 - Within a file: one `class TestXxx` per module/class under test.
-- Shared fixtures and fakes in `tests/conftest.py`.
+- Shared fakes and reusable test helpers live in `tests/fakes.py`; add `tests/conftest.py` only if the project starts needing pytest fixtures.
+
+**Current repository layout**:
+- Foundation and setup: `tests/test_phase1_foundation.py`
+- Ingestion and queue/backpressure: `tests/test_phase2_ingestion.py`, `tests/test_queue_backpressure.py`, `tests/test_events_route.py`
+- Processing and handler flow: `tests/test_phase3_processing.py`, `tests/test_dedup.py`, `tests/test_ordering.py`
+- Core durability and recovery: `tests/test_db_writer.py`, `tests/test_recovery.py`
+- API contracts and startup wiring: `tests/test_api_contract_http.py`, `tests/test_app_lifespan_smoke.py`, `tests/test_alarms.py`, `tests/test_occupancy.py`
+- End-to-end and performance scenarios: `tests/test_integration.py`
+
+**Project-level rule**:
+- Prefer adding the smallest test in the lowest layer that can prove the behavior.
+- Add a higher-level scenario test only when the behavior crosses layers or the contract must be proven end-to-end.
+- When a new shared helper appears more than once, move it into `tests/fakes.py` before duplicating it again.
 
  Good:
 ```

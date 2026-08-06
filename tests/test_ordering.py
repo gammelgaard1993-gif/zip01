@@ -11,63 +11,9 @@ from core.event_log import persist_validated_event
 from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
 from processing.alarm_bus import AlarmBus
+from tests.fakes import FakeRedis
 from processing.handlers.generic import GenericEventHandler
 from processing.worker_pool import WorkerPool
-
-
-class _Pipeline:
-    def __init__(self, redis: "FakeRedis") -> None:
-        self.redis = redis
-        self.ops: list[tuple[str, tuple[Any, ...]]] = []
-
-    def set(self, name: str, value: str) -> "_Pipeline":
-        self.ops.append(("set", (name, value)))
-        return self
-
-    def zadd(self, name: str, mapping: dict[str, float]) -> "_Pipeline":
-        self.ops.append(("zadd", (name, mapping)))
-        return self
-
-    def zremrangebyscore(self, name: str, min: float, max: float) -> "_Pipeline":
-        self.ops.append(("zremrangebyscore", (name, min, max)))
-        return self
-
-    def execute(self) -> object:
-        for op, args in self.ops:
-            getattr(self.redis, op)(*args)
-        self.ops.clear()
-        return True
-
-
-class FakeRedis:
-    """Minimal heartbeat-capable fake (the motion-only test never touches Redis)."""
-
-    def __init__(self) -> None:
-        self.strings: dict[str, str] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
-
-    def pipeline(self) -> _Pipeline:
-        return _Pipeline(self)
-
-    def get(self, name: str) -> str | None:
-        return self.strings.get(name)
-
-    def set(self, name: str, value: str) -> object:
-        self.strings[name] = value
-        return True
-
-    def zadd(self, name: str, mapping: dict[str, float]) -> object:
-        self.zsets.setdefault(name, {}).update(mapping)
-        return True
-
-    def zremrangebyscore(self, name: str, min: float, max: float) -> object:
-        zset = self.zsets.get(name, {})
-        for member in [m for m, score in zset.items() if float(min) <= score <= float(max)]:
-            zset.pop(member, None)
-        return True
-
-    def zcount(self, name: str, min: float, max: float) -> int:
-        return sum(1 for score in self.zsets.get(name, {}).values() if float(min) <= score <= float(max))
 
 
 class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):

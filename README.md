@@ -40,6 +40,19 @@ The service connects to `localhost:6379` (Redis, required) by default and listen
 HTTP `POST /events` is the primary transport (what the reference generator
 [event_generator/generate.py](event_generator/generate.py) posts to).
 
+## Testing
+
+The test suite is organized by behavior layer so the project-level structure stays readable:
+
+- Foundation and harness setup
+- Ingestion, queueing, and backpressure
+- Processing, ordering, and deduplication
+- Core durability and recovery
+- API contracts and startup wiring
+- Integration and scenario coverage
+
+Shared test doubles and helper conventions are documented in [docs/testing-structure.md](docs/testing-structure.md).
+
 ## AI Collaboration Template (v1)
 
 This repository includes a lightweight v1 collaboration template under .github/ for GitHub/Copilot customization:
@@ -51,6 +64,7 @@ This repository includes a lightweight v1 collaboration template under .github/ 
 - .github/prompts/*.prompt.md: explicit reusable command-style workflows.
 - .github/agents/: native custom agents for reusable workflows and specialist roles.
 - .github/hooks/: pre/post tool guardrail scripts (invoked by your selected runner).
+
 ## Documentation
 
 Project documentation is available in the docs folder:
@@ -61,4 +75,4 @@ Project documentation is available in the docs folder:
 - [Critical Functions](docs/critical-functions.md)
 - [API Reference](docs/api-reference.md)
 - [Storage and Recovery](docs/storage-recovery.md)
-
+- [Testing Structure](docs/testing-structure.md)

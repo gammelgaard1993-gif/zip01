@@ -9,17 +9,7 @@ from typing import Any, cast
 from core.metrics import get_counters
 from models import Priority, ValidatedEvent
 from processing.handlers.fall_warn import FallWarnHandler
-
-
-class FakeRedis:
-    def __init__(self) -> None:
-        self._store: dict[str, str] = {}
-
-    def set(self, name: str, value: str, ex: int, nx: bool) -> bool:
-        if nx and name in self._store:
-            return False
-        self._store[name] = value
-        return True
+from tests.fakes import FakeRedis
 
 
 class FakeAlarmBus:

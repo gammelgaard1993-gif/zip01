@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import unittest
@@ -9,69 +10,20 @@ from typing import Any, AsyncIterator, cast
 from unittest.mock import patch
 
 from fastapi import Response
+from starlette.datastructures import Headers
 
 import config
 from api.routes.events import ingest_event
 from core.metrics import get_counters
 from ingestion.queue import PriorityEventQueue
 from models import Priority
-
-
-def _new_events_db() -> sqlite3.Connection:
-    connection = sqlite3.connect(":memory:", check_same_thread=False)
-    connection.execute(
-        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, "
-        "room_id TEXT NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL, "
-        "received_at TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)"
-    )
-    connection.commit()
-    return connection
-
-
-class _FakeRequest:
-    # Minimal stand-in for fastapi.Request: the route only touches .headers, .stream(),
-    # .app.state.event_queue and .app.state.db_connection, so we avoid a full ASGI/TestClient
-    # (and its Redis lifespan).
-    def __init__(
-        self,
-        body: bytes,
-        event_queue: PriorityEventQueue,
-        headers: dict[str, str] | None = None,
-        db_connection: sqlite3.Connection | None = None,
-    ) -> None:
-        self._body = body
-        # None mirrors the route's getattr fallback (no Content-Length available); a dict behaves
-        # like fastapi's case-insensitive Headers.get for the keys the route reads.
-        self.headers = headers
-        self.db_connection = db_connection if db_connection is not None else _new_events_db()
-        self.app = SimpleNamespace(
-            state=SimpleNamespace(event_queue=event_queue, db_connection=self.db_connection)
-        )
-
-    async def stream(self) -> AsyncIterator[bytes]:
-        # Split into small chunks (rather than one blob) so the route's running-total size check
-        # is genuinely exercised incrementally, like a real streamed request body.
-        chunk_size = 4096
-        for offset in range(0, len(self._body), chunk_size):
-            yield self._body[offset : offset + chunk_size]
-
-
-def _flat_event(event_type: str = "heartbeat", **extra: Any) -> bytes:
-    event: dict[str, Any] = {
-        "device_id": "dev_1",
-        "room_id": "room_1",
-        "type": event_type,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "seq": 1,
-        **extra,
-    }
-    return json.dumps(event).encode("utf-8")
+from tests.fakes import FakeIngestRequest, flat_event, new_events_db
 
 
 class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepts_valid_event_and_enqueues_with_derived_payload(self) -> None:
         queue = PriorityEventQueue(100)
-        request = _FakeRequest(_flat_event("presence", in_room=True), queue)
+        request = FakeIngestRequest(flat_event("presence", in_room=True), queue)
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -85,7 +37,7 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fall_warn_goes_to_high_lane(self) -> None:
         queue = PriorityEventQueue(100)
-        request = _FakeRequest(_flat_event("fall_warn", confidence=0.9), queue)
+        request = FakeIngestRequest(flat_event("fall_warn", confidence=0.9), queue)
         response = Response()
 
         await ingest_event(cast(Any, request), response)
@@ -98,7 +50,7 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_json_returns_400(self) -> None:
         queue = PriorityEventQueue(100)
-        request = _FakeRequest(b"not json", queue)
+        request = FakeIngestRequest(b"not json", queue)
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -112,7 +64,7 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         body = json.dumps(
             {"device_id": "dev_1", "type": "heartbeat", "ts": datetime.now(timezone.utc).isoformat()}
         ).encode("utf-8")
-        request = _FakeRequest(body, queue)
+        request = FakeIngestRequest(body, queue)
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -124,7 +76,7 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_future_clock_skew_returns_202_rejected_and_not_enqueued(self) -> None:
         queue = PriorityEventQueue(100)
         future_ts = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-        request = _FakeRequest(_flat_event("heartbeat", ts=future_ts), queue)
+        request = FakeIngestRequest(flat_event("heartbeat", ts=future_ts), queue)
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -138,8 +90,8 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         # so a crash after ack cannot lose it. Before the change the durable write happened later
         # in the worker, so this asserted-on-accept row did not yet exist.
         queue = PriorityEventQueue(100)
-        db = _new_events_db()
-        request = _FakeRequest(_flat_event("heartbeat"), queue, db_connection=db)
+        db = new_events_db()
+        request = FakeIngestRequest(flat_event("heartbeat"), queue, db_connection=db)
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -152,7 +104,7 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         # A storage failure must not falsely accept the event: no 202, no enqueue, so the client
         # can retry (no false accept, no silent loss).
         queue = PriorityEventQueue(100)
-        request = _FakeRequest(_flat_event("heartbeat"), queue)
+        request = FakeIngestRequest(flat_event("heartbeat"), queue)
         response = Response()
 
         with patch(
@@ -164,6 +116,58 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(result, {"error": "persist_failed"})
         self.assertTrue(queue.empty())
+
+    async def test_high_event_is_accepted_while_normal_event_is_backpressured(self) -> None:
+        queue = PriorityEventQueue(1)
+        db = new_events_db()
+
+        # Fill NORMAL lane to capacity first.
+        await ingest_event(
+            cast(Any, FakeIngestRequest(flat_event("heartbeat", seq=1), queue, db_connection=db)),
+            Response(),
+        )
+
+        blocked_normal_request = FakeIngestRequest(
+            flat_event("heartbeat", seq=2), queue, db_connection=db
+        )
+        blocked_normal_response = Response()
+        pending_normal = asyncio.create_task(
+            ingest_event(cast(Any, blocked_normal_request), blocked_normal_response)
+        )
+
+        try:
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(pending_normal), timeout=0.2)
+
+            # HIGH should bypass NORMAL backpressure and complete immediately.
+            high_request = FakeIngestRequest(
+                flat_event("fall_warn", confidence=0.91, seq=3), queue, db_connection=db
+            )
+            high_response = Response()
+            high_result = await asyncio.wait_for(
+                ingest_event(cast(Any, high_request), high_response), timeout=1.0
+            )
+
+            self.assertEqual(high_response.status_code, 202)
+            self.assertEqual(high_result, {"status": "accepted"})
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(pending_normal), timeout=0.2)
+
+            # Free one NORMAL slot and ensure the blocked request resumes.
+            first_out = await queue.get()
+            self.assertEqual(first_out.priority, Priority.HIGH)
+
+            second_out = await queue.get()
+            self.assertEqual(second_out.priority, Priority.NORMAL)
+
+            resumed_result = await asyncio.wait_for(pending_normal, timeout=1.0)
+            self.assertEqual(blocked_normal_response.status_code, 202)
+            self.assertEqual(resumed_result, {"status": "accepted"})
+        finally:
+            if not pending_normal.done():
+                pending_normal.cancel()
+                await asyncio.gather(pending_normal, return_exceptions=True)
 
 
 class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
@@ -177,14 +181,14 @@ class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
 
     def _oversized_body(self) -> bytes:
         # Valid JSON so any failure is attributable to the size guard, not a parse/validation error.
-        body = _flat_event("heartbeat", filler="z" * config.MAX_EVENT_BYTES)
+        body = flat_event("heartbeat", filler="z" * config.MAX_EVENT_BYTES)
         self.assertGreater(len(body), config.MAX_EVENT_BYTES)
         return body
 
     async def test_oversized_content_length_header_returns_413(self) -> None:
         queue = PriorityEventQueue(100)
         body = self._oversized_body()
-        request = _FakeRequest(body, queue, headers={"content-length": str(len(body))})
+        request = FakeIngestRequest(body, queue, headers={"content-length": str(len(body))})
         response = Response()
 
         before = get_counters().get("events_rejected_too_large", 0)
@@ -201,7 +205,7 @@ class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
         # a missing/lying header).
         queue = PriorityEventQueue(100)
         body = self._oversized_body()
-        request = _FakeRequest(body, queue)
+        request = FakeIngestRequest(body, queue)
         response = Response()
 
         before = get_counters().get("events_rejected_too_large", 0)
@@ -216,9 +220,9 @@ class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
     async def test_small_valid_event_still_accepted(self) -> None:
         # Regression guard: a normal in-bound event is unaffected by the size guard.
         queue = PriorityEventQueue(100)
-        body = _flat_event("heartbeat")
+        body = flat_event("heartbeat")
         self.assertLessEqual(len(body), config.MAX_EVENT_BYTES)
-        request = _FakeRequest(body, queue, headers={"content-length": str(len(body))})
+        request = FakeIngestRequest(body, queue, headers={"content-length": str(len(body))})
         response = Response()
 
         result = await ingest_event(cast(Any, request), response)
@@ -239,11 +243,13 @@ class EventsPayloadSizeTests(unittest.IsolatedAsyncioTestCase):
         total_available_chunks = (config.MAX_EVENT_BYTES // chunk_size) * 1000
 
         class _UnboundedStreamRequest:
-            headers = None
+            # Real FastAPI requests always expose a headers mapping; omit Content-Length by
+            # leaving the mapping empty.
+            headers = Headers({})
 
             def __init__(self) -> None:
                 self.app = SimpleNamespace(
-                    state=SimpleNamespace(event_queue=queue, db_connection=_new_events_db())
+                    state=SimpleNamespace(event_queue=queue, db_connection=new_events_db())
                 )
 
             async def stream(self) -> AsyncIterator[bytes]:
