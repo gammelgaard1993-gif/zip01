@@ -17,6 +17,7 @@ class MetricsResponse(BaseModel):
 
 @router.get("/metrics")
 async def metrics(request: Request) -> MetricsResponse:
+    """Return runtime counters, queue depths, and alarm feed latency percentile."""
     counters = get_counters()
     raw_event_queue = getattr(request.app.state, "event_queue", None)
     if raw_event_queue is not None:

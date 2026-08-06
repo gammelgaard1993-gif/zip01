@@ -8,6 +8,21 @@ applyTo: 'api/routes/**/*.py'
 **Audience**: When designing or changing endpoints.  
 **Update Cadence**: When endpoint behavior changes or a new API pattern emerges; treat as a breaking-change contract.
 
+## Challenge Override
+
+zip01 is submitted against the Teton streaming-backend challenge. For challenge-scored endpoints,
+the contract in `REQUIREMENTS.md` and local evaluator expectations in `eval/check.py` override
+the generic envelope examples in this file.
+
+Applies to:
+- `POST /events`
+- `GET /devices/{device_id}/health`
+- `GET /rooms/{room_id}/occupancy`
+- `GET /alarms`
+
+Only apply the success/error envelope conventions below to new or non-challenge endpoints unless
+the challenge contract is explicitly revised.
+
 ---
 
 ## Response Format

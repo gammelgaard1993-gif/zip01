@@ -21,6 +21,7 @@ router = APIRouter()
 
 @router.post("/events")
 async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
+    """Validate, durably persist, and enqueue one incoming device event."""
     # the reference generator POSTs one flat JSON event per request. This route uses the HTTP
     # response as the backpressure signal (a full NORMAL lane makes event_queue.put await,
     # delaying the reply instead of dropping the event).

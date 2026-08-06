@@ -26,6 +26,23 @@ Keep it concise and stable. Put machine-specific overrides in `CLAUDE.local.md` 
   - `python -m unittest discover -s tests -v`
 - Reuse existing patterns in `api/`, `processing/`, `core/`, and `tests/`.
 
+## Challenge Contract Precedence
+
+This repository is built for the Teton streaming-backend challenge. When guidance conflicts,
+the challenge-facing runtime contract takes precedence over generic style guidance.
+
+- Primary source of endpoint and payload truth:
+  - `REQUIREMENTS.md` (API Contract section)
+  - `eval/check.py` (what the local evaluator reads)
+- Keep grader-facing response shapes stable for:
+  - `POST /events`
+  - `GET /devices/{device_id}/health`
+  - `GET /rooms/{room_id}/occupancy`
+  - `GET /alarms`
+
+Do not normalize these endpoints to a generic envelope format unless the challenge contract is
+updated and tests/eval compatibility are updated in the same change.
+
 ## Collaboration Precedence
 
 When multiple guidance sources apply, use this order:

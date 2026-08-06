@@ -190,13 +190,25 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         live_payload = json.loads(second_chunk.removeprefix("data: ").strip())
         self.assertEqual(live_payload["room_id"], room_id)
 
+    async def test_alarm_stream_invalid_since_returns_400(self) -> None:
+        alarm_bus = AlarmBus()
+        with self.assertRaises(HTTPException) as ctx:
+            await alarms_stream(
+                room_id="room_1",
+                since="not-a-timestamp",
+                db_connection=self.db,
+                alarm_bus=alarm_bus,
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, "invalid since")
+
     async def test_alarm_stream_subscribes_before_replay_without_duplicates(self) -> None:
         room_id = "room_race"
         replay_ts = datetime(2026, 6, 29, 14, 0, 0, tzinfo=timezone.utc)
 
         class RaceAlarmBus(AlarmBus):
-            async def subscribe(self, subscribed_room_id: str) -> asyncio.Queue[AlarmEvent]:
-                queue = await super().subscribe(subscribed_room_id)
+            async def subscribe(self, room_id: str) -> asyncio.Queue[AlarmEvent]:
+                queue = await super().subscribe(room_id)
                 cursor = self_outer.db.execute(
                     "INSERT INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
                     ("dev_race", room_id, replay_ts.isoformat(), 0.8, "race-insert", replay_ts.isoformat()),

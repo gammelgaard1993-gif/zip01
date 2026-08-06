@@ -112,6 +112,7 @@ async def room_occupancy(
     redis_client: Redis = Depends(get_redis_client),
     redis_executor: Executor | None = Depends(get_redis_executor),
 ) -> RoomOccupancyResponse:
+    """Return current room occupancy and occupied percentage for the requested window."""
     occupancy_redis = cast(_OccupancyRedisReader, redis_client)
     duration = parse_window(window)
     now = datetime.now(timezone.utc).timestamp()

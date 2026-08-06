@@ -42,12 +42,32 @@ def _validated_since_iso(since: float) -> str:
         raise HTTPException(status_code=400, detail="invalid since") from exc
 
 
+def _validated_stream_since_iso(since: str | None) -> str | None:
+    if since is None:
+        return None
+
+    raw_since = since.strip()
+    if not raw_since:
+        raise HTTPException(status_code=400, detail="invalid since")
+
+    normalized_since = raw_since[:-1] + "+00:00" if raw_since.endswith("Z") else raw_since
+    try:
+        parsed = datetime.fromisoformat(normalized_since)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid since") from exc
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 @router.get("/alarms")
 async def get_alarms(
     since: float = 0.0,
     room_id: str | None = None,
     db_connection: Connection = Depends(get_db_connection),
 ) -> StreamingResponse:
+    """Return persisted fall warnings since a given epoch, ordered by (ts, id)."""
     # `since` is a float epoch (matches the reference stub). Convert to a UTC ISO string so it
     # compares lexically against the stored `ts` (also UTC isoformat). Defaults to 0 (epoch),
     # which returns the full history.
@@ -144,11 +164,14 @@ async def alarms_stream(
     db_connection: Connection = Depends(get_db_connection),
     alarm_bus: AlarmBus = Depends(get_alarm_bus),
 ) -> StreamingResponse:
+    """Stream per-room fall alarms over SSE with optional historical replay."""
+    since_iso = _validated_stream_since_iso(since)
+
     async def event_generator() -> AsyncIterator[str]:
         queue = await alarm_bus.subscribe(room_id)
         try:
             replay_high_water = 0
-            if since is not None:
+            if since_iso is not None:
                 high_water_cursor = db_connection.cursor()
                 high_water_cursor.execute(
                     "SELECT COALESCE(MAX(id), 0) FROM fall_warnings WHERE room_id = ?",
@@ -168,7 +191,7 @@ async def alarms_stream(
                         "ORDER BY ts ASC, id ASC LIMIT ?",
                         (
                             room_id,
-                            since,
+                            since_iso,
                             replay_high_water,
                             last_ts,
                             last_ts,
@@ -189,10 +212,10 @@ async def alarms_stream(
             while True:
                 alarm = await queue.get()
                 if (
-                    since is not None
+                    since_iso is not None
                     and alarm.fall_warning_id is not None
                     and alarm.fall_warning_id <= replay_high_water
-                    and alarm.ts.isoformat() >= since
+                    and alarm.ts.isoformat() >= since_iso
                 ):
                     continue
                 # Feed latency is observed centrally in AlarmBus._dispatch_room (at dispatch time),

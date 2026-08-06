@@ -37,6 +37,7 @@ async def device_health(
     redis_client: Redis = Depends(get_redis_client),
     redis_executor: Executor | None = Depends(get_redis_executor),
 ) -> DeviceHealthResponse:
+    """Return latest heartbeat timestamp and 5-minute availability for a device."""
     if redis_executor is not None:
         loop = asyncio.get_running_loop()
         last_heartbeat_value, availability = await loop.run_in_executor(

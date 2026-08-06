@@ -113,6 +113,11 @@ Media type:
 
 - `text/event-stream`
 
+Responses:
+
+- `400 Bad Request` — `{"detail": "invalid since"}` when `since` is present but empty or not a
+  valid ISO timestamp.
+
 Behavior:
 
 - Subscribes to the room queue before replay so alarms published during historical catch-up are
