@@ -1,4 +1,4 @@
-# Databases
+﻿# Databases
 *.db
 *.db-shm
 *.db-wal
@@ -17,6 +17,12 @@ env/
 # Env / secrets
 .env
 .env.*
+CLAUDE.local.md
+.github/copilot-instructions.local.md
+settings.local.json
+.github/settings.local.json
+.mcp.local.json
+.github/.mcp.local.json
 
 # Submission & project docs (internal use only)
 SUBMISSION.md
@@ -34,3 +40,4 @@ Thumbs.db
 
 # Local benchmarking
 _bench.py
+
