@@ -46,6 +46,13 @@ class _Pipeline:
         return self
 
     def execute(self) -> list[object]:
+        """Apply queued pipeline operations in order and return per-command results.
+
+        The fake pipeline mirrors Redis pipeline semantics used in tests:
+        writes mutate the underlying ``FakeRedis`` store immediately in execution order,
+        reads observe prior operations from the same batch, and one result is appended
+        for each queued command. The operation queue is cleared after execution.
+        """
         results: list[object] = []
         for op, args in self._ops:
             if op == "set":
