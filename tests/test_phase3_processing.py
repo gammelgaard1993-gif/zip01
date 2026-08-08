@@ -209,18 +209,13 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fall_warn_recovery_republishes_unpublished_row_once(self) -> None:
         event = self._event("fall_warn", payload={"confidence": 0.95}, ts=datetime.now(timezone.utc))
-        dedup_key = FallWarnHandler(FakeRedis(), self.db, FakeAlarmBus())._dedup_key(event)
-        self.db.execute(
-            "INSERT INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at, published_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
-            (
-                event.device_id,
-                event.room_id,
-                event.ts.isoformat(),
-                0.95,
-                dedup_key,
-                event.received_at.isoformat(),
-            ),
-        )
+        seed_alarm_bus = FakeAlarmBus()
+        seed_handler = FallWarnHandler(FakeRedis(), self.db, seed_alarm_bus)
+        await seed_handler.handle(event)
+
+        # Simulate a durable row that exists but was never marked as published
+        # (e.g. crash boundary between publish and marker update).
+        self.db.execute("UPDATE fall_warnings SET published_at = NULL")
         self.db.commit()
 
         redis_client = FakeRedis()
@@ -229,10 +224,7 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
 
         await handler.handle(event)
 
-        row = self.db.execute(
-            "SELECT published_at FROM fall_warnings WHERE dedup_key = ?",
-            (dedup_key,),
-        ).fetchone()
+        row = self.db.execute("SELECT published_at FROM fall_warnings").fetchone()
         self.assertIsNotNone(row[0])
         self.assertEqual(len(alarm_bus.published), 1)
 
