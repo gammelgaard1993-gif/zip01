@@ -107,8 +107,9 @@ Shutdown sequence:
     `WATCH`/`MULTI`. Equal timestamps converge by a deterministic `device_id:in_room` tie-breaker;
     conflicts retry and increment `presence_watch_conflicts`. Trimming preserves exactly one
     pre-window anchor with an exclusive score boundary.
-  - `FallWarnHandler`: deduplicates, persists alarms to SQLite, and publishes the committed row ID
-    with each alarm so API replay can reconcile durable and live delivery.
+  - `FallWarnHandler`: deduplicates and persists alarms to SQLite first, publishes alarms, and
+    stamps `published_at` so conflict-path replay is idempotent (republish only when a durable
+    row exists with `published_at IS NULL`).
   - `GenericEventHandler`: no-op beyond persistence (already done in worker flow); handles
     `motion`, `sleep_state`, `net_status`, and is the fallback for any unmapped event type.
 

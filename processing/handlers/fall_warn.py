@@ -66,8 +66,8 @@ class FallWarnHandler:
         dedup_key = self._dedup_key(event)
         confidence = float(event.payload.get("confidence", 0.0))
         sql = (
-            "INSERT OR IGNORE INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)"
         )
         params = (
             event.device_id,
@@ -89,31 +89,64 @@ class FallWarnHandler:
             rowcount, lastrowid = cursor.rowcount, cursor.lastrowid
 
         if rowcount == 0:
+            cursor = self.db_connection.cursor()
+            cursor.execute("SELECT published_at FROM fall_warnings WHERE dedup_key = ?", (dedup_key,))
+            row = cursor.fetchone()
+            published_at = row[0] if row is not None else None
+
             # SQLite already holds a row for this dedup_key. Two situations reach here:
-            #  - Recovery replay (self.replay): re-applying durable history. This is NOT a new
-            #    duplicate, so it is tracked separately as a DB conflict and must never inflate the
-            #    grader-facing dedup count.
+            #  - Recovery replay / crash recovery: the durable row exists but has not yet been
+            #    published. We must deliver it now, then stamp published_at so the replay path is
+            #    idempotent across restarts.
             #  - Live ingestion (not replay): a genuine duplicate of the same detection (in-window
             #    or arriving after the Redis cache entry expired -- SQLite has no TTL, so it keeps
             #    rejecting duplicates of the same event forever). The requirement implies a single
             #    dedup count ("two duplicates -> dedup counter += 2"), so this is counted as a
             #    dedup just like an in-window one.
-            if self.replay:
-                increment_counter("fall_warnings_db_conflicts")
-                conflict_event = "fall_db_conflict"
-            else:
-                increment_counter("fall_warnings_deduped")
-                conflict_event = "fall_dedup_post_ttl"
+            if published_at is not None:
+                if self.replay:
+                    increment_counter("fall_warnings_db_conflicts")
+                    conflict_event = "fall_db_conflict"
+                else:
+                    increment_counter("fall_warnings_deduped")
+                    conflict_event = "fall_dedup_post_ttl"
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": conflict_event,
+                            "device_id": event.device_id,
+                            "room_id": event.room_id,
+                            "dedup": True,
+                        }
+                    )
+                )
+                return
+
             logger.info(
                 json.dumps(
                     {
-                        "event": conflict_event,
+                        "event": "fall_warn_republish",
                         "device_id": event.device_id,
                         "room_id": event.room_id,
-                        "dedup": True,
+                        "dedup": False,
                     }
                 )
             )
+
+            alarm = AlarmEvent(
+                device_id=event.device_id,
+                room_id=event.room_id,
+                ts=event.ts,
+                confidence=confidence,
+                received_at=event.received_at,
+                fall_warning_id=lastrowid,
+            )
+            await self.alarm_bus.publish(alarm)
+            cursor.execute(
+                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                (event.received_at.isoformat(), dedup_key),
+            )
+            self.db_connection.commit()
             return
 
         # Best-effort cache write for fast in-process dedup visibility only; the durable insert
@@ -146,6 +179,12 @@ class FallWarnHandler:
             fall_warning_id=lastrowid,
         )
         await self.alarm_bus.publish(alarm)
+        cursor = self.db_connection.cursor()
+        cursor.execute(
+            "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+            (event.received_at.isoformat(), dedup_key),
+        )
+        self.db_connection.commit()
 
     def _cache_dedup(self, dedup_key: str) -> None:
         try:

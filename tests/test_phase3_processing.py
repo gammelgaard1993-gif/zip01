@@ -50,7 +50,8 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
                 ts TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 dedup_key TEXT NOT NULL UNIQUE,
-                received_at TEXT NOT NULL
+                received_at TEXT NOT NULL,
+                published_at TEXT
             );
             """
         )
@@ -204,6 +205,35 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
 
         row_count = self.db.execute("SELECT COUNT(*) FROM fall_warnings").fetchone()[0]
         self.assertEqual(row_count, 1)
+        self.assertEqual(len(alarm_bus.published), 1)
+
+    async def test_fall_warn_recovery_republishes_unpublished_row_once(self) -> None:
+        event = self._event("fall_warn", payload={"confidence": 0.95}, ts=datetime.now(timezone.utc))
+        dedup_key = FallWarnHandler(FakeRedis(), self.db, FakeAlarmBus())._dedup_key(event)
+        self.db.execute(
+            "INSERT INTO fall_warnings (device_id, room_id, ts, confidence, dedup_key, received_at, published_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            (
+                event.device_id,
+                event.room_id,
+                event.ts.isoformat(),
+                0.95,
+                dedup_key,
+                event.received_at.isoformat(),
+            ),
+        )
+        self.db.commit()
+
+        redis_client = FakeRedis()
+        alarm_bus = FakeAlarmBus()
+        handler = FallWarnHandler(redis_client, self.db, alarm_bus, replay=True)
+
+        await handler.handle(event)
+
+        row = self.db.execute(
+            "SELECT published_at FROM fall_warnings WHERE dedup_key = ?",
+            (dedup_key,),
+        ).fetchone()
+        self.assertIsNotNone(row[0])
         self.assertEqual(len(alarm_bus.published), 1)
 
     async def test_generic_event_types_persist_via_admission(self) -> None:

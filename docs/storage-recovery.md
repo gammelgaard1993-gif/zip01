@@ -26,7 +26,7 @@ Defined in `core/db.py`:
     (`device_id`, `room_id`, `type`, `ts`, `payload` JSON, `received_at`, `late`).
 - `fall_warnings`
   - Durable deduplicated fall alarms
-    (`device_id`, `room_id`, `ts`, `confidence`, `dedup_key`, `received_at`).
+    (`device_id`, `room_id`, `ts`, `confidence`, `dedup_key`, `received_at`, `published_at`).
   - Uniqueness enforced by `UNIQUE(dedup_key)`.
   - Composite `(ts, id)` and `(room_id, ts, id)` indexes support stable bounded keyset reads for
     complete alarm-list responses and race-free SSE replay.
@@ -36,6 +36,10 @@ Defined in `core/db.py`:
 The connection runs `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000` (`core/db.py`)
 so the per-event insert on the hot path avoids an fsync per commit while staying crash-safe for
 committed transactions except on OS/power loss (which snapshot + replay recovery tolerates).
+
+Startup schema compatibility is enforced in `init_db`: `events.late` and
+`fall_warnings.published_at` are added for older databases using `PRAGMA table_info` checks and
+`ALTER TABLE` when missing.
 
 ## Persistence Semantics
 
@@ -51,6 +55,9 @@ committed transactions except on OS/power loss (which snapshot + replay recovery
   reservation taken before a failed insert would make a legitimate retry look like a duplicate).
 - After commit, the inserted row ID is attached to the live `AlarmEvent`, allowing SSE consumers
   to suppress replay/live overlap without missing or duplicating alarms.
+- Publish idempotency is tracked in SQLite: after successful alarm publish, the handler updates
+  `published_at`; on conflict, a row with `published_at IS NULL` is republished once and then
+  stamped.
 - Commits are explicit (`db_connection.commit()`) per insertion path.
 
 ## Snapshot Semantics
@@ -111,9 +118,11 @@ Replay notes:
   - Rebuilt from snapshot plus replay.
 - Snapshot unavailable/corrupt:
   - Replay still rebuilds from full event log.
-- Duplicate fall warnings after Redis restart:
+- Duplicate fall warnings with already-published rows:
   - SQLite unique `dedup_key` prevents durable duplication.
-  - Counted separately as DB conflict metric.
+  - Live path counts `fall_warnings_deduped`; replay path counts `fall_warnings_db_conflicts`.
+- Durable row exists but publish marker is missing (`published_at IS NULL`):
+  - Conflict path republishes once and stamps `published_at`, preventing repeat publish loops.
 - Out-of-order event insertion:
   - Replay reads `ORDER BY ts ASC` to recover chronological state.
 

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS fall_warnings (
     ts TEXT NOT NULL,
     confidence REAL NOT NULL,
     dedup_key TEXT NOT NULL UNIQUE,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    published_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fall_ts ON fall_warnings(ts);
 CREATE INDEX IF NOT EXISTS idx_fall_room ON fall_warnings(room_id, ts);
@@ -48,6 +49,8 @@ def init_db(path: str = SQLITE_PATH) -> Connection:
     connection = sqlite3.connect(str(database_file), check_same_thread=False)
     _apply_pragmas(connection)
     connection.executescript(SCHEMA)
+    _ensure_events_late_column(connection)
+    _ensure_fall_warning_published_column(connection)
     connection.commit()
     return connection
 
@@ -62,6 +65,20 @@ def _apply_pragmas(connection: Connection) -> None:
     connection.execute("PRAGMA journal_mode=WAL;")
     connection.execute("PRAGMA synchronous=NORMAL;")
     connection.execute("PRAGMA busy_timeout=5000;")
+
+
+def _ensure_fall_warning_published_column(connection: Connection) -> None:
+    cursor = connection.execute("PRAGMA table_info(fall_warnings)")
+    columns = {str(row[1]) for row in cursor.fetchall()}
+    if "published_at" not in columns:
+        connection.execute("ALTER TABLE fall_warnings ADD COLUMN published_at TEXT")
+
+
+def _ensure_events_late_column(connection: Connection) -> None:
+    cursor = connection.execute("PRAGMA table_info(events)")
+    columns = {str(row[1]) for row in cursor.fetchall()}
+    if "late" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN late INTEGER NOT NULL DEFAULT 0")
 
 
 def get_db_connection(path: str = SQLITE_PATH) -> Connection:

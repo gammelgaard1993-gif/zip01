@@ -40,7 +40,8 @@ def _new_db() -> sqlite3.Connection:
             ts TEXT NOT NULL,
             confidence REAL NOT NULL,
             dedup_key TEXT NOT NULL UNIQUE,
-            received_at TEXT NOT NULL
+            received_at TEXT NOT NULL,
+            published_at TEXT
         );
         CREATE TABLE state_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -38,7 +38,8 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
                 ts TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 dedup_key TEXT NOT NULL UNIQUE,
-                received_at TEXT NOT NULL
+                received_at TEXT NOT NULL,
+                published_at TEXT
             )
             """
         )

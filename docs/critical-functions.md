@@ -191,6 +191,8 @@ Side effects:
 - On a newly-inserted row, best-effort writes a Redis dedup key with TTL (`config.py`) as a
   non-gating cache, then publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus`
   for replay/live overlap reconciliation.
+- After a successful publish, stamps `fall_warnings.published_at` so replay can be idempotent
+  across restart boundaries.
 - Updates alarm/dedup/conflict counters.
 
 Failure behavior:
@@ -203,10 +205,13 @@ Failure behavior:
 - A Redis outage on the best-effort cache write after a successful insert is logged and swallowed;
   it never blocks the durable insert or the alarm publish.
 - `INSERT OR IGNORE` conflict (`cursor.rowcount == 0`) means SQLite already holds this
-  `dedup_key`. On the live path this is a real duplicate (in-window or after the Redis cache entry
-  would have expired -- SQLite has no TTL) and counts `fall_warnings_deduped`; during recovery
-  replay (`replay=True`) it is an expected re-apply and counts `fall_warnings_db_conflicts`
-  instead, so the dedup count is never inflated by recovery.
+  `dedup_key`; the handler then reads `published_at` for that row.
+- If `published_at IS NULL`, the row is durable but has not been published yet (for example,
+  across crash/recovery boundaries): republish once and stamp `published_at` with an `UPDATE`
+  guarded by `published_at IS NULL`.
+- If `published_at` is not null, do not republish. On the live path this counts
+  `fall_warnings_deduped`; on the replay path (`replay=True`) it counts
+  `fall_warnings_db_conflicts`, so dedup metrics are not inflated by recovery.
 
 ## API Computation Functions
 
