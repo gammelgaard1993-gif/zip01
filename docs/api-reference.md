@@ -36,6 +36,9 @@ Behavior:
 - Validates via `ingestion.validator.validate_raw_event`.
 - Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
   event survives a crash. On a storage error the response is `503` and the event is not enqueued.
+- Persistence and queue insertion are cancellation-shielded as one admission operation. A client
+  that disconnects during admission may not receive `202`, but the durable event still finishes
+  queue insertion before request cancellation propagates.
 - Enqueues to the HIGH lane (`fall_warn`) or the bounded NORMAL lane.
 - Backpressure: a full NORMAL lane delays the response (`await event_queue.put`) rather than
   dropping; HIGH returns immediately under normal/burst load and awaits capacity only when the
@@ -78,7 +81,7 @@ Behavior:
   preserved pre-window anchor), so a room occupied since before the window reports correctly.
 - Replays transitions in `ts` order to accumulate occupied seconds.
 
-## GET /alarms?since=<epoch>&room_id=<id>
+## GET `/alarms?since=<epoch>&room_id=<id>`
 
 Source: `api/routes/alarms.py`
 
@@ -105,7 +108,7 @@ Behavior:
   mixed into that response and remain retrievable on the next request; no hard limit truncates
   persisted alarms.
 
-## GET /alarms/stream?room_id=<id>&since=<iso>
+## GET `/alarms/stream?room_id=<id>&since=<iso>`
 
 Source: `api/routes/alarms.py`
 
@@ -146,5 +149,7 @@ Returns a `counters` object with runtime metrics, including:
   `events_rejected_invalid_schema`, `events_rejected_clock_skew`,
   `events_rejected_clock_skew_future`, `events_rejected_clock_skew_past`
 - Fall handling: `fall_warnings_total`, `fall_warnings_deduped`, `fall_warnings_db_conflicts`
+- Admission/processing: `events_persist_failed`, `events_enqueue_failed`,
+  `presence_watch_conflicts`
 - Backpressure: `queue_pressure`, `queue_depth_high`, `queue_depth_normal`
 - Latency: `alarm_feed_latency_ms_p95`

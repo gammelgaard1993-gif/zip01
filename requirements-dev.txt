@@ -4,3 +4,6 @@
 # In-memory Redis used when USE_FAKE_REDIS=1 (see core/redis_client.py) and by the
 # in-process test suite. Not a runtime dependency of the service itself.
 fakeredis==2.36.2
+
+# Starlette 1.x TestClient transport (required by fastapi.testclient).
+httpx2==2.9.1

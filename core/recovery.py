@@ -344,6 +344,40 @@ class RecoveryManager:
                     normalized_entries.append({"member": member, "score": float(score_value)})
                 zsets[key_text] = normalized_entries
 
+        legacy_presence_state = any(
+            key.startswith("room:")
+            and key.endswith(":presence")
+            and "tie_breaker" not in mapping
+            for key, mapping in hashes.items()
+        )
+        legacy_occupancy_state = False
+        for key, entries in zsets.items():
+            if not (key.startswith("room:") and key.endswith(":occupancy")):
+                continue
+            for entry in entries:
+                try:
+                    member = json.loads(entry["member"])
+                except (json.JSONDecodeError, ValueError):
+                    legacy_occupancy_state = True
+                    break
+                if not isinstance(member, dict) or "tie_breaker" not in member:
+                    legacy_occupancy_state = True
+                    break
+            if legacy_occupancy_state:
+                break
+
+        if legacy_presence_state or legacy_occupancy_state:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "snapshot_rejected",
+                        "reason": "legacy_presence_tie_semantics",
+                        "snapshot_ts": snapshot_ts,
+                    }
+                )
+            )
+            return None, None
+
         return snapshot_ts, {"strings": strings, "hashes": hashes, "zsets": zsets}
 
     def _clear_managed_state(self, redis_client: _RecoveryRedis) -> None:

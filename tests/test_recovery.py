@@ -21,6 +21,47 @@ class _FakePipeline:
     def __init__(self, redis: "PipelineFakeRedis") -> None:
         self._redis = redis
         self._ops: list[tuple[str, tuple[Any, ...]]] = []
+        self._watching = False
+
+    def watch(self, *names: str) -> None:
+        self._watching = True
+
+    def multi(self) -> None:
+        self._watching = False
+
+    def reset(self) -> None:
+        self._ops = []
+        self._watching = False
+
+    def hgetall(self, name: str) -> dict[str, str]:
+        if not self._watching:
+            raise RuntimeError("hgetall is only supported while watching")
+        return self._redis.hgetall(name)
+
+    def zrevrangebyscore(
+        self,
+        name: str,
+        max: float | str,
+        min: float | str,
+        start: int = 0,
+        num: int = 1,
+        withscores: bool = False,
+    ) -> list[tuple[str, float]] | list[str]:
+        if not self._watching:
+            raise RuntimeError("zrevrangebyscore is only supported while watching")
+        return self._redis.zrevrangebyscore(
+            name, max, min, start=start, num=num, withscores=withscores
+        )
+
+    def zrangebyscore(
+        self,
+        name: str,
+        min: float | str,
+        max: float | str,
+    ) -> list[str]:
+        if not self._watching:
+            raise RuntimeError("zrangebyscore is only supported while watching")
+        return cast(list[str], self._redis.zrangebyscore(name, min, max))
 
     def set(self, name: str, value: str) -> object:
         self._ops.append(("set", (name, value)))
@@ -34,7 +75,9 @@ class _FakePipeline:
         self._ops.append(("zadd", (name, mapping)))
         return self
 
-    def zremrangebyscore(self, name: str, min: float, max: float) -> object:
+    def zremrangebyscore(
+        self, name: str, min: float | str, max: float | str
+    ) -> object:
         self._ops.append(("zremrangebyscore", (name, min, max)))
         return self
 
@@ -52,10 +95,8 @@ class _FakePipeline:
                 zset.update(mapping)
             elif op == "zremrangebyscore":
                 name, min_score, max_score = args
-                zset = self._redis.zsets.get(name, {})
-                for member in [m for m, score in zset.items() if min_score <= score <= max_score]:
-                    del zset[member]
-        self._ops = []
+                self._redis.zremrangebyscore(name, min_score, max_score)
+        self.reset()
         return None
 
 
@@ -171,11 +212,23 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
         snapshot_ts = datetime(2026, 6, 29, 12, 0, 0, tzinfo=timezone.utc).isoformat()
         snapshot_state: SnapshotState = {
             "strings": {"device:dev_1:last_heartbeat": snapshot_ts},
-            "hashes": {"room:room_1:presence": {"in_room": "true", "ts": snapshot_ts}},
+            "hashes": {
+                "room:room_1:presence": {
+                    "in_room": "true",
+                    "ts": snapshot_ts,
+                    "tie_breaker": "dev_1:1",
+                }
+            },
             "zsets": {
                 "room:room_1:occupancy": [
                     {
-                        "member": json.dumps({"ts": snapshot_ts, "in_room": True}),
+                        "member": json.dumps(
+                            {
+                                "ts": snapshot_ts,
+                                "in_room": True,
+                                "tie_breaker": "dev_1:1",
+                            }
+                        ),
                         "score": datetime.fromisoformat(snapshot_ts).timestamp(),
                     }
                 ]
@@ -194,6 +247,59 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_redis.strings["device:dev_1:last_heartbeat"], snapshot_ts)
         self.assertEqual(fake_redis.hashes["room:room_1:presence"]["in_room"], "true")
         self.assertIn("room:room_1:occupancy", fake_redis.zsets)
+
+    async def test_restore_state_rejects_legacy_presence_snapshot_and_fully_replays(self) -> None:
+        fake_redis = FakeRedis()
+        event_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
+        snapshot_ts = (event_ts + timedelta(minutes=5)).isoformat()
+        legacy_snapshot: SnapshotState = {
+            "strings": {},
+            "hashes": {
+                "room:room_legacy:presence": {
+                    "in_room": "true",
+                    "ts": event_ts.isoformat(),
+                }
+            },
+            "zsets": {
+                "room:room_legacy:occupancy": [
+                    {
+                        "member": json.dumps(
+                            {"ts": event_ts.isoformat(), "in_room": True}
+                        ),
+                        "score": event_ts.timestamp(),
+                    }
+                ]
+            },
+        }
+        self.db.execute(
+            "INSERT INTO state_snapshots (snapshot_ts, state_json) VALUES (?, ?)",
+            (snapshot_ts, json.dumps(legacy_snapshot)),
+        )
+        for device_id, in_room in (("dev_z", False), ("dev_a", True)):
+            self.db.execute(
+                "INSERT INTO events (device_id, room_id, type, ts, payload, received_at, late) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    "room_legacy",
+                    "presence",
+                    event_ts.isoformat(),
+                    json.dumps({"in_room": in_room}),
+                    event_ts.isoformat(),
+                    0,
+                ),
+            )
+        self.db.commit()
+
+        manager = RecoveryManager(
+            self.db, cast(Any, fake_redis), cast(Any, FakeAlarmBus())
+        )
+        await manager.restore_state()
+
+        state = fake_redis.hgetall("room:room_legacy:presence")
+        self.assertEqual(state["in_room"], "false")
+        self.assertEqual(state["tie_breaker"], "dev_z:0")
+        self.assertEqual(len(fake_redis.zsets["room:room_legacy:occupancy"]), 1)
 
     async def test_replay_events_uses_inclusive_received_at_cutoff(self) -> None:
         fake_redis = FakeRedis()

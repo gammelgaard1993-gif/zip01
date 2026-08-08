@@ -8,27 +8,18 @@ from datetime import datetime, timezone
 from typing import Protocol, cast
 
 from config import OCCUPANCY_WINDOW_SECONDS
+from core.metrics import increment_counter
 from models import ValidatedEvent
 from redis import Redis
+from redis.exceptions import WatchError
 
 logger = logging.getLogger(__name__)
 
 
 class _RedisPipeline(Protocol):
-    def hset(self, name: str, mapping: dict[str, str]) -> object:
+    def watch(self, *names: str) -> object:
         ...
 
-    def zadd(self, name: str, mapping: dict[str, float]) -> object:
-        ...
-
-    def zremrangebyscore(self, name: str, min: float, max: float) -> object:
-        ...
-
-    def execute(self) -> object:
-        ...
-
-
-class _PipelineCapableRedis(Protocol):
     def hgetall(self, name: str) -> dict[str, str | bytes | bytearray | memoryview]:
         ...
 
@@ -43,6 +34,36 @@ class _PipelineCapableRedis(Protocol):
     ) -> list[tuple[str | bytes | bytearray | memoryview, float]]:
         ...
 
+    def zrangebyscore(
+        self,
+        name: str,
+        min: float | str,
+        max: float | str,
+    ) -> list[str | bytes | bytearray | memoryview]:
+        ...
+
+    def multi(self) -> object:
+        ...
+
+    def hset(self, name: str, mapping: dict[str, str]) -> object:
+        ...
+
+    def zadd(self, name: str, mapping: dict[str, float]) -> object:
+        ...
+
+    def zremrangebyscore(
+        self, name: str, min: float | str, max: float | str
+    ) -> object:
+        ...
+
+    def execute(self) -> object:
+        ...
+
+    def reset(self) -> None:
+        ...
+
+
+class _PipelineCapableRedis(Protocol):
     def pipeline(self) -> _RedisPipeline:
         ...
 
@@ -86,46 +107,90 @@ class PresenceHandler:
             raise TypeError(f"in_room must be a boolean, got {type(in_room_raw).__name__}")
         in_room = in_room_raw
         now_score = datetime.now(timezone.utc).timestamp()
+        tie_breaker = f"{event.device_id}:{int(in_room)}"
 
         # Cast once to the precise read/pipeline Protocol so hgetall/zrevrangebyscore/pipeline all
         # carry fully-known types instead of the concrete client's partially-Any stub returns.
         redis_client = cast(_PipelineCapableRedis, self.redis)
 
-        current = redis_client.hgetall(key_state)
-        current_dt = None
-        if current:
-            current_ts = current.get("ts")
-            if current_ts is not None:
-                try:
-                    current_ts_text = _as_text(current_ts)
-                    current_dt = datetime.fromisoformat(current_ts_text)
-                except ValueError:
-                    current_dt = None
-
-        transition_value = json.dumps({"ts": ts_value, "in_room": in_room})
+        transition_value = json.dumps(
+            {"ts": ts_value, "in_room": in_room, "tie_breaker": tie_breaker}
+        )
         cutoff = now_score - OCCUPANCY_WINDOW_SECONDS
 
-        # Preserve the most recent transition at or before the window cutoff as an initial-state
-        # anchor so the 1h occupancy query can recover the room's state at the window start. A
-        # plain zremrangebyscore(0, cutoff) would delete the only transition of a room occupied
-        # since before the window, making it report artificially low occupancy. The anchor may be
-        # an existing pre-cutoff transition OR this event itself when it is a late event older
-        # than the window; we trim only transitions strictly older than that anchor, keeping the
-        # zset bounded to the in-window transitions plus a single anchor.
-        existing_anchor = redis_client.zrevrangebyscore(
-            key_transitions, cutoff, "-inf", start=0, num=1, withscores=True
-        )
-        anchor_scores = [entry[1] for entry in existing_anchor]
-        if ts_score <= cutoff:
-            anchor_scores.append(ts_score)
-        trim_cutoff = (max(anchor_scores) - 1e-3) if anchor_scores else cutoff
+        while True:
+            pipeline = redis_client.pipeline()
+            try:
+                pipeline.watch(key_state, key_transitions)
+                current = pipeline.hgetall(key_state)
+                current_dt = None
+                current_tie_breaker = ""
+                if current:
+                    current_ts = current.get("ts")
+                    if current_ts is not None:
+                        try:
+                            current_dt = datetime.fromisoformat(_as_text(current_ts))
+                        except ValueError:
+                            current_dt = None
+                    raw_tie_breaker = current.get("tie_breaker")
+                    if raw_tie_breaker is not None:
+                        current_tie_breaker = _as_text(raw_tie_breaker)
 
-        pipeline = redis_client.pipeline()
-        pipeline.zadd(key_transitions, {transition_value: ts_score})
-        if current_dt is None or event.ts > current_dt:
-            pipeline.hset(key_state, mapping={"in_room": json.dumps(in_room), "ts": ts_value})
-        pipeline.zremrangebyscore(key_transitions, 0, trim_cutoff)
-        pipeline.execute()
+                should_update_state = (
+                    current_dt is None
+                    or event.ts > current_dt
+                    or (event.ts == current_dt and tie_breaker > current_tie_breaker)
+                )
+                same_timestamp_transitions = pipeline.zrangebyscore(
+                    key_transitions, ts_score, ts_score
+                )
+                existing_tie_breakers: list[str] = []
+                for raw_transition in same_timestamp_transitions:
+                    try:
+                        transition = json.loads(_as_text(raw_transition))
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(transition, dict):
+                        existing_tie_breakers.append(str(transition.get("tie_breaker", "")))
+                should_update_transition = (
+                    not existing_tie_breakers
+                    or tie_breaker > max(existing_tie_breakers)
+                )
+
+                # Preserve the most recent transition at or before the window cutoff as an
+                # initial-state anchor. Watching both keys makes the comparison, anchor choice,
+                # insertion, and trimming one optimistic transaction across concurrent devices.
+                existing_anchor = pipeline.zrevrangebyscore(
+                    key_transitions, cutoff, "-inf", start=0, num=1, withscores=True
+                )
+                anchor_scores = [entry[1] for entry in existing_anchor]
+                if ts_score <= cutoff:
+                    anchor_scores.append(ts_score)
+                trim_cutoff: float | str = (
+                    f"({max(anchor_scores)}" if anchor_scores else cutoff
+                )
+
+                pipeline.multi()
+                if should_update_transition:
+                    pipeline.zremrangebyscore(key_transitions, ts_score, ts_score)
+                    pipeline.zadd(key_transitions, {transition_value: ts_score})
+                if should_update_state:
+                    pipeline.hset(
+                        key_state,
+                        mapping={
+                            "in_room": json.dumps(in_room),
+                            "ts": ts_value,
+                            "tie_breaker": tie_breaker,
+                        },
+                    )
+                pipeline.zremrangebyscore(key_transitions, 0, trim_cutoff)
+                pipeline.execute()
+                break
+            except WatchError:
+                increment_counter("presence_watch_conflicts")
+                continue
+            finally:
+                pipeline.reset()
 
         logger.info(
             json.dumps(

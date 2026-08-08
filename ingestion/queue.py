@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from config import HIGH_QUEUE_MAX_SIZE
 from models import Priority, ValidatedEvent
-
-logger = logging.getLogger(__name__)
 
 class PriorityEventQueue:
     def __init__(self, normal_max_size: int) -> None:
         self.high_queue: asyncio.Queue[ValidatedEvent] = asyncio.Queue(maxsize=HIGH_QUEUE_MAX_SIZE)
         self.normal_queue: asyncio.Queue[ValidatedEvent] = asyncio.Queue(maxsize=normal_max_size)
         self._normal_max_size = normal_max_size
+        self._item_available = asyncio.Event()
 
     def qsize_high(self) -> int:
         return self.high_queue.qsize()
@@ -29,72 +27,36 @@ class PriorityEventQueue:
     async def put(self, event: ValidatedEvent) -> None:
         if event.priority == Priority.HIGH:
             await self.high_queue.put(event)
-            return
-
-        await self.normal_queue.put(event)
+        else:
+            await self.normal_queue.put(event)
+        self._item_available.set()
 
     def put_nowait(self, event: ValidatedEvent) -> None:
         if event.priority == Priority.HIGH:
             self.high_queue.put_nowait(event)
-            return
+        else:
+            self.normal_queue.put_nowait(event)
+        self._item_available.set()
 
-        self.normal_queue.put_nowait(event)
+    async def _wait_until_available(self) -> None:
+        await self._item_available.wait()
 
     async def get(self) -> ValidatedEvent:
-        # Fast path: serve HIGH before NORMAL without awaiting when data is ready.
-        if not self.high_queue.empty():
-            return self.high_queue.get_nowait()
-        if not self.normal_queue.empty():
-            return self.normal_queue.get_nowait()
+        while True:
+            try:
+                return self.high_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
 
-        # Both lanes empty: wait on *both* so an idle consumer wakes on a HIGH arrival instead
-        # of parking on the NORMAL lane (which would delay a fall_warn until the next NORMAL event).
-        high_getter = asyncio.ensure_future(self.high_queue.get())
-        normal_getter = asyncio.ensure_future(self.normal_queue.get())
-        try:
-            await asyncio.wait(
-                {high_getter, normal_getter}, return_when=asyncio.FIRST_COMPLETED
-            )
-        except asyncio.CancelledError:
-            # A getter may have already completed (item removed from its lane) before this outer
-            # await was cancelled; cancel() on a done task is a no-op, so without putting the item
-            # back it would be silently lost. The lane may have been refilled to capacity in the
-            # window since the getter completed, so put_nowait can raise -- log and drop rather
-            # than crash the caller with an unrelated QueueFull during cancellation.
-            for getter, lane in ((high_getter, self.high_queue), (normal_getter, self.normal_queue)):
-                if getter.done() and not getter.cancelled() and getter.exception() is None:
-                    try:
-                        lane.put_nowait(getter.result())
-                    except asyncio.QueueFull:
-                        logger.warning("priority queue get() cancelled: lane full, dropping recovered item")
-                else:
-                    getter.cancel()
-            raise
+            try:
+                return self.normal_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
 
-        # Cancelling a pending asyncio.Queue.get() leaves the (absent) item untouched, so the
-        # lane that did not fire loses nothing.
-        high_event = self._collect(high_getter)
-        normal_event = self._collect(normal_getter)
-
-        if high_event is not None:
-            if normal_event is not None:
-                # Both fired at once: serve HIGH, return NORMAL to its lane. We just took one out,
-                # so there is room and put_nowait cannot raise.
-                self.normal_queue.put_nowait(normal_event)
-            return high_event
-        # HIGH did not fire, so FIRST_COMPLETED guarantees NORMAL did.
-        assert normal_event is not None
-        return normal_event
-
-    @staticmethod
-    def _collect(getter: "asyncio.Task[ValidatedEvent]") -> ValidatedEvent | None:
-        # Called synchronously right after asyncio.wait, so the getter's done-state is stable.
-        # A completed getter has already removed its item from the queue; a pending one is
-        # cancelled (its item, if any, stays in the queue for the next get()).
-        if getter.done():
-            return None if getter.cancelled() else getter.result()
-        getter.cancel()
-        return None
+            self._item_available.clear()
+            if not self.high_queue.empty() or not self.normal_queue.empty():
+                continue
+            await self._wait_until_available()
 
     def empty(self) -> bool:
         return self.high_queue.empty() and self.normal_queue.empty()

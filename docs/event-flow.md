@@ -28,6 +28,9 @@
   later. A storage error returns `503`
   (`{"error": "persist_failed"}`, counted `events_persist_failed`) and the event is neither
   enqueued nor acknowledged, so the client can retry (no false accept, no silent loss).
+- Persistence and queue insertion run as one cancellation-shielded admission task. The event is
+  registered in the in-flight watermark before persistence and removed after handling (or after a
+  pre-persist failure), so client cancellation cannot create a durable-but-unqueued gap.
 
 ### 2) Queueing and Backpressure
 
@@ -39,6 +42,8 @@
   delayed until capacity frees up; the event is never dropped. A full lane also increments
   `queue_pressure`. HIGH `fall_warn` is not stalled behind NORMAL (no priority inversion); a
   saturated HIGH lane backpressures rather than dropping.
+- An idle `get()` waits on a shared availability signal and rechecks HIGH before NORMAL. Cancelling
+  that wait cannot remove or strand a later event from either lane.
 
 ### 3) Worker Routing and Ordering
 
@@ -53,8 +58,9 @@
   events that arrive within the same `DEVICE_REORDER_BUFFER_MS` window. An event arriving after
   its device's buffer already flushed (arbitrarily late, e.g. an offline device catching up) is
   applied later than chronologically-newer events already handled. Nothing is lost or dropped in
-  this case; ts-aware, idempotent handlers (heartbeat/presence only advance state when strictly
-  newer by `ts`) keep the derived aggregate correct regardless of apply order, and the durable
+  this case; ts-aware, idempotent handlers keep the derived aggregate correct regardless of apply
+  order. Heartbeat advances only for a newer `ts`; presence also resolves equal timestamps with a
+  deterministic tie-breaker. The durable
   SQLite log still has both rows. Guaranteeing strict order for unbounded lateness would require
   unbounded per-device buffering, which is not compatible with real-time alarm latency.
 
@@ -78,10 +84,13 @@ For each flushed event:
   - Trim zset to configured window.
 
 - `presence`
-  - Append transition JSON (`ts`, `in_room`) in `room:{id}:occupancy` zset.
-  - Update `room:{id}:presence` hash only if event timestamp is newer.
-  - Trim transitions zset to the window but keep one pre-window anchor transition, so longer
-    windows (e.g. `1h`) can still recover the room's state at the window start.
+  - `WATCH` the room presence hash and occupancy zset, recompute from fresh values, then update
+    both atomically with `MULTI`/`EXEC`.
+  - Keep one canonical transition per timestamp. Newer timestamps win; equal timestamps use the
+    maximum `device_id:in_room` tie-breaker in both the hash and transition member.
+  - On `WatchError`, retry and increment `presence_watch_conflicts`.
+  - Trim strictly below the selected pre-window anchor using an exclusive score boundary, so the
+    occupancy API can recover the state at the start of longer windows.
 
 - `fall_warn`
   - Build dedup key from device, room, and second-truncated timestamp.
@@ -128,10 +137,13 @@ For each flushed event:
 1. Startup loads latest snapshot from SQLite.
 2. Managed Redis keys are cleared.
 3. Snapshot data is reapplied to Redis.
+  Snapshots containing legacy presence state without tie-break metadata are rejected instead,
+  including their cutoff, and recovery starts from the full durable log.
 4. Events are replayed from SQLite in timestamp order.
 5. Replay cutoff is on `received_at` (ingestion order), inclusive of the snapshot timestamp, so
    late events ingested after the snapshot are not dropped.
-6. Timestamp-aware handlers prevent stale state from overwriting newer state.
+6. Timestamp-aware handlers prevent stale overwrite; deterministic presence ties make replay
+  converge even when SQLite rows share the same `ts`.
 
 ## Failure and Edge Behavior
 

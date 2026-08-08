@@ -16,6 +16,17 @@ class _Pipeline:
     def __init__(self, redis: "FakeRedis") -> None:
         self._redis = redis
         self._ops: list[tuple[str, tuple[object, ...]]] = []
+        self._watching = False
+
+    def watch(self, *names: str) -> None:
+        self._watching = True
+
+    def multi(self) -> None:
+        self._watching = False
+
+    def reset(self) -> None:
+        self._ops = []
+        self._watching = False
 
     def set(self, name: str, value: str) -> "_Pipeline":
         self._ops.append(("set", (name, value)))
@@ -37,9 +48,36 @@ class _Pipeline:
         self._ops.append(("get", (name,)))
         return self
 
-    def hgetall(self, name: str) -> "_Pipeline":
+    def hgetall(self, name: str) -> "_Pipeline | dict[str, str]":
+        if self._watching:
+            return self._redis.hgetall(name)
         self._ops.append(("hgetall", (name,)))
         return self
+
+    def zrevrangebyscore(
+        self,
+        name: str,
+        max: float | str,
+        min: float | str,
+        start: int = 0,
+        num: int = 1,
+        withscores: bool = False,
+    ) -> object:
+        if self._watching:
+            return self._redis.zrevrangebyscore(
+                name, max, min, start=start, num=num, withscores=withscores
+            )
+        raise RuntimeError("zrevrangebyscore is only supported while watching")
+
+    def zrangebyscore(
+        self,
+        name: str,
+        min: float | str,
+        max: float | str,
+    ) -> object:
+        if self._watching:
+            return self._redis.zrangebyscore(name, min, max)
+        raise RuntimeError("zrangebyscore is only supported while watching")
 
     def zrange(self, name: str, start: int, end: int, withscores: bool = False) -> "_Pipeline":
         self._ops.append(("zrange", (name, start, end, withscores)))
@@ -70,13 +108,13 @@ class _Pipeline:
                 results.append(True)
             elif op == "zremrangebyscore":
                 name, min_score, max_score = args
-                zset = self._redis.zsets.get(str(name), {})
-                min_bound = float(cast(float | str, min_score))
-                max_bound = float(cast(float | str, max_score))
-                to_remove = [m for m, score in zset.items() if min_bound <= score <= max_bound]
-                for member in to_remove:
-                    zset.pop(member, None)
-                results.append(len(to_remove))
+                results.append(
+                    self._redis.zremrangebyscore(
+                        str(name),
+                        cast(float | str, min_score),
+                        cast(float | str, max_score),
+                    )
+                )
             elif op == "get":
                 name = str(args[0])
                 results.append(self._redis.get(name))
@@ -93,7 +131,7 @@ class _Pipeline:
                         withscores=bool(withscores),
                     )
                 )
-        self._ops = []
+        self.reset()
         return results
 
 
@@ -145,9 +183,20 @@ class FakeRedis:
         zset.update(mapping)
         return True
 
-    def zremrangebyscore(self, name: str, min: float, max: float) -> int:
+    def zremrangebyscore(
+        self, name: str, min: float | str, max: float | str
+    ) -> int:
         zset = self.zsets.get(name, {})
-        to_remove = [member for member, score in zset.items() if float(min) <= score <= float(max)]
+        min_exclusive = isinstance(min, str) and min.startswith("(")
+        max_exclusive = isinstance(max, str) and max.startswith("(")
+        min_score = float(min[1:]) if min_exclusive else float(min)
+        max_score = float(max[1:]) if max_exclusive else float(max)
+        to_remove = [
+            member
+            for member, score in zset.items()
+            if (score > min_score if min_exclusive else score >= min_score)
+            and (score < max_score if max_exclusive else score <= max_score)
+        ]
         for member in to_remove:
             zset.pop(member, None)
         return len(to_remove)
@@ -245,12 +294,17 @@ class FakeIngestRequest:
         event_queue: PriorityEventQueue,
         headers: dict[str, str] | None = None,
         db_connection: sqlite3.Connection | None = None,
+        worker_pool: Any | None = None,
     ) -> None:
         self._body = body
         self.headers = Headers(headers or {})
         self.db_connection = db_connection if db_connection is not None else new_events_db()
         self.app = SimpleNamespace(
-            state=SimpleNamespace(event_queue=event_queue, db_connection=self.db_connection)
+            state=SimpleNamespace(
+                event_queue=event_queue,
+                db_connection=self.db_connection,
+                worker_pool=worker_pool,
+            )
         )
 
     async def stream(self) -> AsyncIterator[bytes]:

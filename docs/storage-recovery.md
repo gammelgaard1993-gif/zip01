@@ -8,8 +8,8 @@ Managed key families:
 
 - `device:{device_id}:last_heartbeat` (string timestamp)
 - `device:{device_id}:heartbeats` (zset of heartbeat timestamps)
-- `room:{room_id}:presence` (hash with `in_room`, `ts`)
-- `room:{room_id}:occupancy` (zset of occupancy transitions)
+- `room:{room_id}:presence` (hash with `in_room`, `ts`, deterministic `tie_breaker`)
+- `room:{room_id}:occupancy` (zset of canonical occupancy transitions with tie metadata)
 - `dedup:{sha256(...)}` (fall dedup key with TTL)
 
 Primary purpose:
@@ -42,6 +42,9 @@ committed transactions except on OS/power loss (which snapshot + replay recovery
 - Every accepted event is inserted into `events` at admission — before the `POST /events` `202`
   response — so durability never depends on the worker finishing. A storage error surfaces as
   `503` instead of a false accept.
+- Persistence and queue insertion are one cancellation-shielded admission operation. The event's
+  `received_at` is registered as in-flight before persistence, removed on a pre-persist failure,
+  and otherwise retained until its handler finishes or fails.
 - `fall_warn` handler inserts into `fall_warnings` first (SQLite `UNIQUE(dedup_key)` is the
   authoritative reservation); Redis is written only after a successful insert, as a best-effort,
   non-gating cache. This avoids a persistence failure permanently suppressing an alarm (a Redis
@@ -68,6 +71,8 @@ capture time (falling back to `now()` when nothing is in flight), not wall-clock
 closes a race where an event received before the snapshot but still queued/buffered during capture
 would be absent from both the snapshot and the `received_at`-cutoff replay. Because this cutoff is
 non-monotonic, snapshots are selected by insertion `id` (not `snapshot_ts`) on restore.
+The in-flight interval covers pre-persist admission through handler completion, so cancellation,
+backpressure, and isolated handler failure cannot prematurely relax the cutoff.
 
 Captured Redis structures:
 
@@ -94,6 +99,8 @@ Replay notes:
 - A malformed / non-dict snapshot is rejected (never crashes startup and never keeps its cutoff);
   recovery falls back to a full replay of the durable log, which is correct because every event is
   persisted at admission.
+- Presence snapshots created before deterministic tie metadata existed are also rejected. Both
+  their state and cutoff are discarded, so full replay canonicalizes equal-timestamp room state.
 - Replay invokes same handlers used in normal flow.
 - Timestamp-aware handlers avoid stale overwrite of newer state.
 - Malformed rows are skipped instead of failing recovery.
@@ -116,7 +123,12 @@ Behavior validated by test suite:
 
 - Non-blocking backpressure and no HIGH/NORMAL priority inversion under a saturated normal lane
   (`tests/test_queue_backpressure.py`)
+- Cancellation-safe persist-to-enqueue admission and watermark cleanup (`tests/test_events_route.py`)
+- Cancelled queue waits conserve HIGH/NORMAL events during lane refill
+  (`tests/test_queue_backpressure.py`)
 - High lane priority over normal lane (`tests/test_phase2_ingestion.py`)
 - Handler isolation and persistence flow (`tests/test_phase3_processing.py`)
 - Snapshot restore and replay boundary correctness (`tests/test_recovery.py`)
+- Atomic same-room presence conflicts, equal-timestamp convergence, real-Redis concurrency, and
+  legacy snapshot fallback (`tests/test_presence_atomic.py`, `tests/test_recovery.py`)
 - Burst alarm latency and replay equivalence checks (`tests/test_integration.py`)

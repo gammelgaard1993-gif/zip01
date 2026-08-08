@@ -25,6 +25,9 @@ The service starts in FastAPI lifespan and wires:
 
 Primary startup wiring is in `api/app.py`. The service listens on `:8080` (see `config.py`).
 
+Current correctness baseline: **113 tests run: 112 passed, 1 optional real-Redis concurrency test skipped**
+when `TEST_REDIS_URL` is absent. Challenge-scale throughput remains a separate benchmark task.
+
 ## Scope Notes
 
 - Documentation is based on current code and tests in this repository.

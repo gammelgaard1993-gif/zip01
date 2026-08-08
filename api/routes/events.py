@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -17,6 +18,25 @@ from models import Priority
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _await_admission(task: asyncio.Task[None]) -> None:
+    """Finish durable admission before propagating request cancellation."""
+    try:
+        await asyncio.shield(task)
+        return
+    except asyncio.CancelledError as cancellation:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    break
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise cancellation
 
 
 @router.post("/events")
@@ -112,47 +132,74 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
     #    any deployment that hasn't wired one up).
     db_connection: sqlite3.Connection = request.app.state.db_connection
     sqlite_writer = getattr(request.app.state, "sqlite_writer", None)
-    try:
-        if sqlite_writer is not None:
-            await persist_validated_event_async(sqlite_writer, validated)
-        else:
-            persist_validated_event(db_connection, validated)
-    except (sqlite3.Error, SQLiteWriterError) as exc:
-        increment_counter("events_persist_failed")
-        logger.error(
-            json.dumps(
-                {
-                    "event": "persist_failed",
-                    "device_id": validated.device_id,
-                    "type": validated.type,
-                    "reason": "writer_unavailable" if isinstance(exc, SQLiteWriterError) else "sqlite_error",
-                }
+    worker_pool = getattr(request.app.state, "worker_pool", None)
+    received_at_iso = validated.received_at.isoformat()
+    if worker_pool is not None:
+        worker_pool.mark_inflight(received_at_iso)
+
+    event_queue: PriorityEventQueue = request.app.state.event_queue
+
+    async def persist_and_enqueue() -> None:
+        persisted = False
+        try:
+            if sqlite_writer is not None:
+                await persist_validated_event_async(sqlite_writer, validated)
+            else:
+                persist_validated_event(db_connection, validated)
+            persisted = True
+
+            if validated.priority == Priority.NORMAL and event_queue.normal_is_full():
+                increment_counter("queue_pressure")
+                logger.warning(
+                    json.dumps(
+                        {
+                            "event": "queue_pressure",
+                            "lane": "NORMAL",
+                            "depth": event_queue.qsize_normal(),
+                        }
+                    )
+                )
+            await event_queue.put(validated)
+        except (sqlite3.Error, SQLiteWriterError) as exc:
+            increment_counter("events_persist_failed")
+            logger.error(
+                json.dumps(
+                    {
+                        "event": "persist_failed",
+                        "device_id": validated.device_id,
+                        "type": validated.type,
+                        "reason": (
+                            "writer_unavailable"
+                            if isinstance(exc, SQLiteWriterError)
+                            else "sqlite_error"
+                        ),
+                    }
+                )
             )
-        )
+            if worker_pool is not None:
+                worker_pool.unmark_inflight(received_at_iso)
+            raise
+        except Exception:
+            if persisted:
+                increment_counter("events_enqueue_failed")
+                logger.exception(
+                    "durable event could not be enqueued",
+                    extra={"device_id": validated.device_id, "event_type": validated.type},
+                )
+            elif worker_pool is not None:
+                worker_pool.unmark_inflight(received_at_iso)
+            raise
+        except BaseException:
+            if not persisted and worker_pool is not None:
+                worker_pool.unmark_inflight(received_at_iso)
+            raise
+
+    admission_task = asyncio.create_task(persist_and_enqueue())
+    try:
+        await _await_admission(admission_task)
+    except (sqlite3.Error, SQLiteWriterError) as exc:
         response.status_code = 503
         return {"error": "persist_failed"}
-
-    # Register the event as in-flight (admission -> applied) so a snapshot taken while it is still
-    # queued/buffered uses a replay cutoff old enough to re-cover it on recovery.
-    worker_pool = getattr(request.app.state, "worker_pool", None)
-    if worker_pool is not None:
-        worker_pool.mark_inflight(validated.received_at.isoformat())
-
-    # 4) Enqueue for hot-state processing. HIGH returns immediately; a full NORMAL lane awaits
-    #    capacity (backpressure: the HTTP response is delayed, the event is never dropped).
-    event_queue: PriorityEventQueue = request.app.state.event_queue
-    if validated.priority == Priority.NORMAL and event_queue.normal_is_full():
-        increment_counter("queue_pressure")
-        logger.warning(
-            json.dumps(
-                {
-                    "event": "queue_pressure",
-                    "lane": "NORMAL",
-                    "depth": event_queue.qsize_normal(),
-                }
-            )
-        )
-    await event_queue.put(validated)
 
     logger.info(
         json.dumps(

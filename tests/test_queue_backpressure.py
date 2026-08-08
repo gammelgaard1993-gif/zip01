@@ -10,6 +10,17 @@ from ingestion.queue import PriorityEventQueue
 from models import Priority, ValidatedEvent
 
 
+class _GatedPriorityEventQueue(PriorityEventQueue):
+    def __init__(self, normal_max_size: int) -> None:
+        super().__init__(normal_max_size)
+        self.wait_started = asyncio.Event()
+        self.release_wait = asyncio.Event()
+
+    async def _wait_until_available(self) -> None:
+        self.wait_started.set()
+        await self.release_wait.wait()
+
+
 class QueueBackpressureTests(unittest.IsolatedAsyncioTestCase):
     def _event(self, index: int) -> ValidatedEvent:
         return ValidatedEvent(
@@ -70,6 +81,27 @@ class QueueBackpressureTests(unittest.IsolatedAsyncioTestCase):
 
         second = await asyncio.wait_for(queue.get(), timeout=1.0)
         self.assertEqual(second.priority, Priority.NORMAL)
+        self.assertTrue(queue.empty())
+
+    async def test_cancelled_get_does_not_lose_event_when_lane_refills(self) -> None:
+        queue = _GatedPriorityEventQueue(normal_max_size=1)
+        first_event = self._event(1)
+        second_event = self._event(2)
+
+        getter = asyncio.create_task(queue.get())
+        await queue.wait_started.wait()
+        await queue.put(first_event)
+        blocked_put = asyncio.create_task(queue.put(second_event))
+
+        getter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await getter
+
+        first = await queue.get()
+        self.assertEqual(first.device_id, first_event.device_id)
+        await asyncio.wait_for(blocked_put, timeout=1.0)
+        second = await queue.get()
+        self.assertEqual(second.device_id, second_event.device_id)
         self.assertTrue(queue.empty())
 
 

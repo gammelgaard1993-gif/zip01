@@ -20,6 +20,36 @@ from models import Priority
 from tests.fakes import FakeIngestRequest, flat_event, new_events_db
 
 
+class _InflightTracker:
+    def __init__(self) -> None:
+        self.received_at: dict[str, int] = {}
+
+    def mark_inflight(self, received_at_iso: str) -> None:
+        self.received_at[received_at_iso] = self.received_at.get(received_at_iso, 0) + 1
+
+    def unmark_inflight(self, received_at_iso: str) -> None:
+        count = self.received_at.get(received_at_iso, 0)
+        if count <= 1:
+            self.received_at.pop(received_at_iso, None)
+        else:
+            self.received_at[received_at_iso] = count - 1
+
+    def oldest_inflight_received_at(self) -> str | None:
+        return min(self.received_at) if self.received_at else None
+
+
+class _AdmissionGateQueue(PriorityEventQueue):
+    def __init__(self) -> None:
+        super().__init__(100)
+        self.put_started = asyncio.Event()
+        self.allow_put = asyncio.Event()
+
+    async def put(self, event: Any) -> None:
+        self.put_started.set()
+        await self.allow_put.wait()
+        await super().put(event)
+
+
 class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepts_valid_event_and_enqueues_with_derived_payload(self) -> None:
         queue = PriorityEventQueue(100)
@@ -104,7 +134,8 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         # A storage failure must not falsely accept the event: no 202, no enqueue, so the client
         # can retry (no false accept, no silent loss).
         queue = PriorityEventQueue(100)
-        request = FakeIngestRequest(flat_event("heartbeat"), queue)
+        worker_pool = _InflightTracker()
+        request = FakeIngestRequest(flat_event("heartbeat"), queue, worker_pool=worker_pool)
         response = Response()
 
         with patch(
@@ -116,6 +147,33 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(result, {"error": "persist_failed"})
         self.assertTrue(queue.empty())
+        self.assertIsNone(worker_pool.oldest_inflight_received_at())
+
+    async def test_cancellation_while_queue_put_is_blocked_completes_admission(self) -> None:
+        queue = _AdmissionGateQueue()
+        worker_pool = _InflightTracker()
+        db = new_events_db()
+        request = FakeIngestRequest(
+            flat_event("heartbeat"),
+            queue,
+            db_connection=db,
+            worker_pool=worker_pool,
+        )
+        task = asyncio.create_task(ingest_event(cast(Any, request), Response()))
+
+        await queue.put_started.wait()
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+        self.assertIsNotNone(worker_pool.oldest_inflight_received_at())
+
+        task.cancel()
+        queue.allow_put.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        event = await queue.get()
+        self.assertEqual(event.device_id, "dev_1")
+        worker_pool.unmark_inflight(event.received_at.isoformat())
+        self.assertIsNone(worker_pool.oldest_inflight_received_at())
 
     async def test_high_event_is_accepted_while_normal_event_is_backpressured(self) -> None:
         queue = PriorityEventQueue(1)

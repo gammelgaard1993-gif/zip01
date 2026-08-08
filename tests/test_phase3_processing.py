@@ -17,96 +17,7 @@ from processing.handlers.heartbeat import HeartbeatHandler
 from processing.handlers.presence import PresenceHandler
 from processing.handlers.generic import GenericEventHandler
 from processing.worker_pool import WorkerPool
-
-
-class _Pipeline:
-    def __init__(self, redis: "FakeRedis") -> None:
-        self.redis = redis
-        self.ops: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
-
-    def set(self, name: str, value: str) -> object:
-        self.ops.append(("set", (name, value), {}))
-        return True
-
-    def zadd(self, name: str, mapping: dict[str, float]) -> object:
-        self.ops.append(("zadd", (name, mapping), {}))
-        return True
-
-    def zremrangebyscore(self, name: str, min: float, max: float) -> object:
-        self.ops.append(("zremrangebyscore", (name, min, max), {}))
-        return True
-
-    def hset(self, name: str, mapping: dict[str, str]) -> object:
-        self.ops.append(("hset", (name, mapping), {}))
-        return True
-
-    def execute(self) -> object:
-        for op, args, kwargs in self.ops:
-            getattr(self.redis, op)(*args, **kwargs)
-        self.ops.clear()
-        return True
-
-
-class FakeRedis:
-    def __init__(self) -> None:
-        self.strings: dict[str, str] = {}
-        self.hashes: dict[str, dict[str, str]] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
-
-    def pipeline(self) -> _Pipeline:
-        return _Pipeline(self)
-
-    def get(self, name: str) -> str | None:
-        return self.strings.get(name)
-
-    def set(self, name: str, value: str, *args: object, **kwargs: object) -> object:
-        nx = bool(kwargs.get("nx", False))
-        if nx and name in self.strings:
-            return False
-        self.strings[name] = value
-        return True
-
-    def hgetall(self, name: str) -> dict[str, str]:
-        return dict(self.hashes.get(name, {}))
-
-    def hset(self, name: str, mapping: dict[str, str]) -> object:
-        self.hashes[name] = dict(mapping)
-        return True
-
-    def zadd(self, name: str, mapping: dict[str, float]) -> object:
-        zset = self.zsets.setdefault(name, {})
-        zset.update(mapping)
-        return True
-
-    def zremrangebyscore(self, name: str, min: float, max: float) -> object:
-        if name not in self.zsets:
-            return 0
-        members_to_remove = [member for member, score in self.zsets[name].items() if float(min) <= score <= float(max)]
-        for member in members_to_remove:
-            self.zsets[name].pop(member, None)
-        return len(members_to_remove)
-
-    def zrevrangebyscore(
-        self,
-        name: str,
-        max: float | str,
-        min: float | str,
-        start: int | None = None,
-        num: int | None = None,
-        withscores: bool = False,
-    ) -> list[Any]:
-        max_score = float("inf") if max == "+inf" else float(max)
-        min_score = float("-inf") if min == "-inf" else float(min)
-        ordered = sorted(self.zsets.get(name, {}).items(), key=lambda item: item[1], reverse=True)
-        filtered = [(member, score) for member, score in ordered if min_score <= score <= max_score]
-        if start is not None and num is not None:
-            filtered = filtered[start : start + num]
-        if withscores:
-            return filtered
-        return [member for member, _ in filtered]
-
-    def zcount(self, name: str, min: float, max: float) -> int:
-        return sum(1 for score in self.zsets.get(name, {}).values() if float(min) <= score <= float(max))
+from tests.fakes import FakeRedis
 
 
 class FakeAlarmBus:
@@ -163,9 +74,84 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
             device_id=device_id,
             room_id=room_id,
             type=event_type,
-        from tests.fakes import FakeRedis
             ts=now,
             payload=payload or {},
+            late=False,
+            priority=priority or (
+                Priority.HIGH if event_type == "fall_warn" else Priority.NORMAL
+            ),
+            received_at=now,
+        )
+
+    async def test_worker_pool_uses_configured_worker_count_and_consistent_hashing(self) -> None:
+        pool = WorkerPool(PriorityEventQueue(10), AlarmBus(), self.db, cast(Any, FakeRedis()))
+        pool_internal = cast(Any, pool)
+
+        self.assertEqual(len(pool.worker_queues), WORKER_COUNT)
+        self.assertEqual(pool_internal._worker_index("dev_1"), pool_internal._worker_index("dev_1"))
+        self.assertTrue(0 <= pool_internal._worker_index("dev_2") < WORKER_COUNT)
+
+    async def test_worker_lanes_are_bounded_and_high_drains_before_normal(self) -> None:
+        pool = WorkerPool(PriorityEventQueue(10), AlarmBus(), self.db, cast(Any, FakeRedis()))
+        for worker_queue in pool.worker_queues:
+            self.assertIsInstance(worker_queue, PriorityEventQueue)
+            self.assertEqual(worker_queue.normal_max_size(), WORKER_NORMAL_QUEUE_MAX_SIZE)
+
+        lane = pool.worker_queues[0]
+        await lane.put(self._event("motion"))
+        await lane.put(self._event("motion"))
+        await lane.put(self._event("fall_warn"))
+        first = await lane.get()
+        self.assertEqual(first.priority, Priority.HIGH)
+
+    async def test_stop_drains_buffered_events_before_shutdown(self) -> None:
+        applied: list[str] = []
+
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            applied.append(event.device_id)
+
+        queue = PriorityEventQueue(50)
+        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await queue.put(self._event("motion", device_id="dev_drain"))
+            await pool.stop()
+
+        self.assertIn("dev_drain", applied)
+
+    async def test_inflight_watermark_registers_and_clears_after_handling(self) -> None:
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            return None
+
+        queue = PriorityEventQueue(10)
+        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+        event = self._event("motion", device_id="dev_wm")
+        pool.mark_inflight(event.received_at.isoformat())
+        self.assertEqual(pool.oldest_inflight_received_at(), event.received_at.isoformat())
+
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await queue.put(event)
+            await asyncio.sleep(0.4)
+            await pool.stop()
+
+        self.assertIsNone(pool.oldest_inflight_received_at())
+
+    async def test_worker_pool_error_isolation_continues_processing(self) -> None:
+        queue = PriorityEventQueue(20)
+        pool = WorkerPool(queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+
+        call_count = {"n": 0}
+
+        async def flaky_handle(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("boom")
+
+        with patch.object(GenericEventHandler, "handle", new=flaky_handle):
+            await pool.start()
+            await queue.put(self._event("motion", payload={"seq": 1}))
+            await queue.put(self._event("motion", payload={"seq": 2}))
             await asyncio.sleep(0.6)
             await pool.stop()
 

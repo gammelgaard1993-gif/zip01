@@ -16,7 +16,7 @@ In a second shell, drive load and inspect the API:
 ```bash
 make test                 # unit + integration tests
 make smoke                # quick end-to-end check (service must be running)
-DEVICES=500 make burst    # 10x burst â€” verify no drops + alarm p95 <= 1s
+DEVICES=500 make burst    # load exercise; inspect drops, queue pressure, and alarm p95
 make offline              # offline device replays a 20-min backlog of late events
 ```
 
@@ -28,7 +28,7 @@ Start Redis however you prefer (native installs or Docker Desktop), then run the
 service and simulator directly:
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -r requirements-dev.txt
 python main.py                                              # service on :8080
 python event_generator/generate.py --mode baseline --duration 30 --devices 500 --target http://localhost:8080
 python event_generator/generate.py --mode burst     --duration 30 --devices 500 --target http://localhost:8080
@@ -52,6 +52,12 @@ The test suite is organized by behavior layer so the project-level structure sta
 - Integration and scenario coverage
 
 Shared test doubles and helper conventions are documented in [docs/testing-structure.md](docs/testing-structure.md).
+
+Current local result: **113 tests run: 112 passed, 1 optional real-Redis concurrency test skipped** when
+`TEST_REDIS_URL` is not configured. The suite verifies cancellation-safe admission and queueing,
+atomic presence updates, deterministic recovery, and API contracts. Challenge-scale throughput
+and sustained p95 latency still require a dedicated concurrent load run; the supplied synchronous
+generator is useful for compatibility checks, not as proof of the 5k/s and 50k/s targets.
 
 ## AI Collaboration Template (v1)
 

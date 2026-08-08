@@ -56,6 +56,9 @@ Shutdown sequence:
   - Delegates acceptance rules to the validator.
   - Persist-before-ack: writes the durable `events` row before the `202`; a storage error returns
     `503` (`{"error": "persist_failed"}`) and the event is neither enqueued nor accepted.
+  - Treats persistence and queue insertion as one cancellation-shielded admission operation. If
+    the client disconnects after persistence begins, admission finishes before cancellation is
+    propagated, so a durable event is never abandoned between SQLite and the queue.
   - Applies backpressure through the HTTP response: a full NORMAL lane makes `event_queue.put`
     await, delaying the `202` instead of dropping the event. HIGH `fall_warn` returns immediately
     under normal/burst load; only a saturated HIGH lane (`HIGH_QUEUE_MAX_SIZE`) backpressures, and
@@ -74,6 +77,8 @@ Shutdown sequence:
       `fall_warn` burst; `put()` awaits capacity only under an adversarial flood and never drops.
     - `normal_queue`: bounded (configurable, default 500,000)
   - `get()` always drains high lane first.
+  - Uses a shared availability signal rather than competing lane getter tasks. Cancelling an idle
+    `get()` cannot consume or strand an event, and each wake rechecks HIGH before NORMAL.
 
 ### Processing
 
@@ -92,11 +97,16 @@ Shutdown sequence:
     than by strict apply order (see `tests/test_ordering.py`).
   - Runs hot-state handlers only; durability is owned by admission (the event is persisted to
     SQLite before the `202` response), so a handler failure never risks the durable record.
+  - Tracks each admitted event by `received_at` until handler completion (including isolated
+    failure); the oldest in-flight value protects the snapshot replay cutoff.
   - Isolates handler failures (logs exception and continues).
 
 - Handlers (`processing/handlers/*`)
   - `HeartbeatHandler`: updates device last heartbeat and heartbeat history in Redis.
-  - `PresenceHandler`: updates room occupancy transitions and latest state in Redis.
+  - `PresenceHandler`: atomically updates room occupancy transitions and latest state with Redis
+    `WATCH`/`MULTI`. Equal timestamps converge by a deterministic `device_id:in_room` tie-breaker;
+    conflicts retry and increment `presence_watch_conflicts`. Trimming preserves exactly one
+    pre-window anchor with an exclusive score boundary.
   - `FallWarnHandler`: deduplicates, persists alarms to SQLite, and publishes the committed row ID
     with each alarm so API replay can reconcile durable and live delivery.
   - `GenericEventHandler`: no-op beyond persistence (already done in worker flow); handles
@@ -123,6 +133,8 @@ Routes in `api/routes/*`:
 
 - `core.recovery.RecoveryManager`
   - Loads latest snapshot from SQLite `state_snapshots`.
+  - Rejects legacy presence snapshots without tie-break metadata and discards their cutoff, then
+    performs a full durable-log replay so equal-timestamp state remains deterministic.
   - Clears managed Redis keys and reapplies snapshot.
   - Replays events from SQLite `events` ordered by `ts ASC`.
   - Uses inclusive replay boundary on ingestion order (`received_at >= snapshot_ts`), so late

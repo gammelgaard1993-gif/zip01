@@ -67,6 +67,11 @@ Side effects:
 - Persist-before-ack: writes the durable `events` row before returning `202`, so an accepted
   event is crash-safe. A storage error returns `503`, increments `events_persist_failed`, and the
   event is neither enqueued nor accepted.
+- `_await_admission` shields the combined persist-and-enqueue task. Request cancellation is
+  propagated only after admission finishes, preventing a committed event from being abandoned
+  before queue insertion. Unexpected post-persist queue failures count `events_enqueue_failed`.
+- Registers the event's `received_at` in the worker pool before persistence. A pre-persist failure
+  removes it immediately; normal processing removes it after the handler completes or fails.
 - Increments `events_ingested_total`, reject counters, and `queue_pressure` when the NORMAL
   lane is full.
 - `await event_queue.put(...)` applies backpressure: a full NORMAL lane delays the response;
@@ -88,7 +93,9 @@ Behavior:
 
 Failure behavior:
 
-- Standard async queue wait semantics when no events available.
+- When both lanes are empty, waits on a shared availability event and rechecks HIGH before NORMAL
+  after every wake. Cancelling the wait does not reserve or remove an item, so lane refill and
+  cancellation cannot lose an event.
 
 ### `processing.worker_pool.WorkerPool._router_loop()`
 
@@ -127,6 +134,8 @@ Failure behavior:
 
 - Handler exceptions are logged with context and processing continues; the durable record is
   unaffected because it was written at admission.
+- In-flight watermark registration is removed in `finally` after each event, whether its handler
+  succeeds or fails.
 
 ## Handler Functions
 
@@ -153,11 +162,13 @@ Purpose:
 
 Side effects:
 
-- Appends transition into occupancy zset.
-- Conditionally updates current presence hash if event is newer.
-- Trims transition history to the occupancy window, but preserves the most recent transition at
-  or before the window cutoff as an initial-state anchor so the 1h occupancy query can recover
-  the room's state at the window start.
+- Watches the room presence hash and occupancy zset, reads both, then updates them atomically with
+  `MULTI`/`EXEC`.
+- Keeps one canonical transition per timestamp. Newer timestamps win; equal timestamps use the
+  same deterministic `device_id:in_room` winner for the hash and zset.
+- Retries `WatchError` conflicts from fresh state and increments `presence_watch_conflicts`.
+- Trims transition history strictly below the exact pre-window anchor using Redis's exclusive
+  score boundary, preserving the state needed by the 1h occupancy query.
 
 Failure behavior:
 
@@ -304,6 +315,8 @@ Behavior:
 Failure behavior:
 
 - Individual malformed replay rows are skipped; replay continues.
+- A snapshot with legacy presence hashes or occupancy members lacking `tie_breaker` is rejected
+  together with its cutoff, forcing a full replay with deterministic equal-timestamp semantics.
 
 ### `core.recovery.RecoveryManager._replay_events(since_ts)`
 

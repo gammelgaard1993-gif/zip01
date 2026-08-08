@@ -15,14 +15,17 @@ This repository uses a layered test model so the behavior of the streaming backe
 
 - `tests/test_phase1_foundation.py`: base harness and shared assumptions.
 - `tests/test_phase2_ingestion.py`, `tests/test_events_route.py`, `tests/test_queue_backpressure.py`: ingestion and pressure behavior.
-- `tests/test_phase3_processing.py`, `tests/test_dedup.py`, `tests/test_ordering.py`: worker and handler behavior.
+- `tests/test_phase3_processing.py`, `tests/test_presence_atomic.py`, `tests/test_dedup.py`,
+  `tests/test_ordering.py`: worker, handler, ordering, and atomic same-room presence behavior.
 - `tests/test_db_writer.py`, `tests/test_recovery.py`: durable storage and recovery.
 - `tests/test_api_contract_http.py`, `tests/test_app_lifespan_smoke.py`, `tests/test_alarms.py`, `tests/test_occupancy.py`: API contract and lifecycle behavior.
 - `tests/test_integration.py`: cross-layer flows and scenario checks.
 
 ## Shared Helpers
 
-- Reusable fake clients, response protocols, and request builders live in `tests/fakes.py`.
+- Reusable fake clients, response protocols, and request builders live in `tests/fakes.py`; its
+  shared `FakeRedis` and pipeline model are used across processing, API, occupancy, integration,
+  and recovery tests.
 - Add new helpers there when the same fake or protocol would otherwise be duplicated across files.
 
 ## Adding New Tests
@@ -36,4 +39,6 @@ This repository uses a layered test model so the behavior of the streaming backe
 
 - Fast gate: foundation, ingestion, processing, core, and API contract tests.
 - Extended gate: integration, recovery, and backpressure-heavy scenarios.
-- Manual or scheduled: long-running load and resilience checks.
+- Manual or scheduled: long-running load and resilience checks. The local correctness baseline is
+  **113 run: 112 passed, 1 optional real-Redis test skipped** without `TEST_REDIS_URL`; it does not by
+  itself prove challenge-scale 5k/s baseline, 50k/s burst, or sustained p95 latency.

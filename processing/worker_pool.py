@@ -61,7 +61,7 @@ class WorkerPool:
     def mark_inflight(self, received_at_iso: str) -> None:
         self._inflight_received_at[received_at_iso] = self._inflight_received_at.get(received_at_iso, 0) + 1
 
-    def _mark_done(self, received_at_iso: str) -> None:
+    def unmark_inflight(self, received_at_iso: str) -> None:
         count = self._inflight_received_at.get(received_at_iso)
         if count is None:
             return
@@ -216,7 +216,7 @@ class WorkerPool:
                 finally:
                     # Deregister from the in-flight watermark once processed (applied or failed);
                     # the durable record already exists, so this only relaxes the snapshot cutoff.
-                    self._mark_done(next_event.received_at.isoformat())
+                    self.unmark_inflight(next_event.received_at.isoformat())
 
             device_buffers.pop(device_id, None)
         finally:
