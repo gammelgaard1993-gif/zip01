@@ -49,6 +49,13 @@ class AlarmBus:
         queue: asyncio.Queue[AlarmEvent] = _SubscriberQueue()
         async with self._lock:
             self._subscribers.setdefault(room_id, []).append(queue)
+            # Replay alarms already buffered but not yet dispatched so a subscriber that
+            # arrives after publish() but before _dispatch_room snapshot doesn't miss them.
+            for alarm in self._room_buffers.get(room_id, []):
+                try:
+                    queue.put_nowait(alarm)
+                except asyncio.QueueFull:
+                    break
         return queue
 
     async def unsubscribe(self, room_id: str, queue: asyncio.Queue[AlarmEvent]) -> None:

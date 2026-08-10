@@ -169,9 +169,12 @@ async def alarms_stream(
 ) -> StreamingResponse:
     """Stream per-room fall alarms over SSE with optional historical replay."""
     since_iso = _validated_stream_since_iso(since)
+    # Subscribe before returning StreamingResponse so the queue is registered before HTTP 200
+    # headers are sent — closing the race where _dispatch_room snapshots an empty subscriber
+    # list while the event loop is busy sending headers.
+    queue = await alarm_bus.subscribe(room_id)
 
     async def event_generator() -> AsyncIterator[str]:
-        queue = await alarm_bus.subscribe(room_id)
         try:
             replay_high_water = 0
             if since_iso is not None:

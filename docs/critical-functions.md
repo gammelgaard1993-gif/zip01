@@ -198,6 +198,30 @@ Side effects:
   `alarm_bus.publish()` and SSE delivery.
 - Updates alarm/dedup/conflict counters.
 
+### `processing.alarm_bus.AlarmBus.subscribe(room_id)`
+
+Purpose:
+
+- Register a new SSE subscriber and guarantee it receives any alarms already in-flight.
+
+Behavior:
+
+- Creates a bounded `_SubscriberQueue` and appends it to `_subscribers[room_id]` under
+  `_lock`.
+- While still holding `_lock`, iterates `_room_buffers[room_id]` and calls `put_nowait` for
+  each buffered alarm, stopping on `QueueFull`. This closes the window between `publish()`
+  appending to `_room_buffers` and `_dispatch_room` snapshotting `_subscribers`: without the
+  replay, a subscriber arriving in that window received nothing from that alarm batch.
+- Must be called in the **route handler body** before `return StreamingResponse(...)`. Calling
+  it inside the generator body defers registration until after Starlette sends HTTP 200 headers;
+  under event-loop backlog (100–300ms at ≥193 req/s) this routinely falls outside the
+  `ALARM_REORDER_BUFFER_MS` dispatch window, silently dropping the alarm from the live feed.
+
+Failure behavior:
+
+- `QueueFull` on replay is non-fatal: replay stops early and `_dispatch_room` will evict an
+  already-saturated subscriber through the normal full-queue eviction path.
+
 Failure behavior:
 
 - SQLite is the sole gate: reserving in Redis before the durable insert would let a persistence

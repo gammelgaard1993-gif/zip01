@@ -14,6 +14,34 @@ zip01 is a layered backend for high-volume sensor events.
 7. FastAPI serves read APIs and SSE alarm streams (service listens on `:8080`).
 8. Recovery restores hot state from snapshot + event replay.
 
+## Operational Invariants
+
+The runtime contract is easiest to reason about if it is expressed as a small set of invariants:
+
+1. Persist-before-ack: every accepted event is durably recorded in SQLite before the HTTP
+   response is finalized, so the durable log never lags behind admission.
+2. Per-device ordering is bounded, not absolute: the worker-side reorder buffer gives a
+   short window for late arrivals to be sorted by `ts`, but events that arrive after the flush
+   window still apply in arrival order relative to already-handled work.
+3. Alarm delivery is a staged path: worker buffering, room-level alarm buffering, and SSE fan-out
+   all contribute to the end-to-end latency budget. The scoring target is measured from server
+   ingestion to alarm dispatch, not from device `ts` to subscriber receipt.
+4. Recovery is anchored on ingestion order: late events are replayed when `received_at` falls
+   on or after the snapshot cutoff, even if their device `ts` predates the snapshot.
+5. Backpressure is delay-based, not lossy: the normal lane may slow `/events`, but the system
+   never silently drops events under burst; high-priority `fall_warn` traffic is isolated from
+   normal traffic and only backpressures when its own lane saturates.
+
+### Runtime Path at a Glance
+
+```text
+POST /events
+  └─ validate ──> persist to SQLite ──> enqueue (HIGH/NORMAL)
+       └─ worker router (device-hash) ──> per-device reorder buffer (100ms)
+            └─ handlers (Redis hot state + alarm publication)
+                 └─ per-room alarm buffer (100ms) ──> SSE subscribers / replay
+```
+
 ## Runtime Composition
 
 App initialization (`api/app.py`) creates shared singletons on `app.state`:
@@ -117,7 +145,10 @@ Shutdown sequence:
 
 - `processing.alarm_bus.AlarmBus`
   - Per-room subscribers with async queues.
-  - Per-room reorder buffering before publish.
+  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 100ms).
+  - `subscribe(room_id)` registers the new queue and, under the same lock, replays any alarms
+    already held in `_room_buffers[room_id]` into it, so a subscriber arriving after `publish()`
+    but before the `_dispatch_room` snapshot does not miss in-flight alarms.
   - Supports stream consumption used by SSE endpoint.
 
 ### API
@@ -128,8 +159,10 @@ Routes in `api/routes/*`:
 - Device health from Redis (`/devices/{device_id}/health`)
 - Room occupancy from Redis transitions (`/rooms/{room_id}/occupancy`)
 - Complete alarm list from bounded SQLite keyset batches (`/alarms`)
-- Gap-free alarm SSE stream using subscribe-first SQLite replay + alarm bus overlap suppression
-  (`/alarms/stream`)
+- Gap-free alarm SSE stream (`/alarms/stream`): `alarm_bus.subscribe(room_id)` is called in
+  the route handler body before `return StreamingResponse(...)`, so the subscriber queue is
+  registered before HTTP 200 headers are sent and before the event loop begins executing the
+  generator; SQLite replay then follows, with alarm bus overlap suppression for the boundary
 - Metrics counters, queue depth, and alarm p95 latency (`/metrics`)
 
 ### Recovery

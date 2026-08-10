@@ -117,17 +117,25 @@ For each flushed event:
 1. `fall_warn` accepted by handler.
 2. Alarm persisted to SQLite.
 3. Alarm published to in-memory room buffer in alarm bus.
-4. Alarm bus dispatches after reorder delay to each subscriber queue (bounded,
-   `SSE_SUBSCRIBER_QUEUE_MAX_SIZE`). A subscriber whose queue is full (stalled/slow client) is
-   evicted (`sse_subscribers_evicted`) instead of blocking dispatch to the room's other
-   subscribers; once drained, that client's stream closes and it must reconnect with `since` to
-   resume without a gap.
+4. Alarm bus dispatches after reorder delay (`ALARM_REORDER_BUFFER_MS`, 100ms) to each
+   subscriber queue (bounded, `SSE_SUBSCRIBER_QUEUE_MAX_SIZE`). A subscriber whose queue is full
+   (stalled/slow client) is evicted (`sse_subscribers_evicted`) instead of blocking dispatch to
+   the room's other subscribers; once drained, that client's stream closes and it must reconnect
+   with `since` to resume without a gap.
 5. At dispatch, the alarm bus records feed latency from `received_at` (so it is measured even
    with no stream client connected).
-6. `/alarms/stream` subscribes before historical replay, captures a durable high-water ID, and
-  replays matching alarms in bounded `(ts, id)` batches.
-7. Buffered alarms already covered by replay are suppressed by durable ID; newer buffered alarms
-  are then yielded as SSE `data:` frames, so the replay/live boundary has no gap.
+6. `/alarms/stream` calls `alarm_bus.subscribe(room_id)` in the route handler body, **before**
+   `return StreamingResponse(...)`. This ensures the subscriber queue is registered before HTTP
+   200 headers are sent — the `event_generator` coroutine only executes after Starlette has
+   committed those headers, so any subscription placed inside the generator body would arrive
+   after the event loop has already processed a backlog of pending I/O (100–300ms under load),
+   past the 100ms `_dispatch_room` window. `subscribe()` also replays any alarms already held
+   in `_room_buffers[room_id]` into the new queue under the same lock, so an alarm published
+   between `subscribe()` and the `_dispatch_room` snapshot is not silently dropped.
+7. After subscribing, the route captures a durable high-water ID and replays matching alarms
+   from SQLite in bounded `(ts, id)` batches.
+8. Buffered alarms already covered by replay are suppressed by durable ID; newer buffered alarms
+   are then yielded as SSE `data:` frames, so the replay/live boundary has no gap.
 
 ## Alarm History Read Path
 
