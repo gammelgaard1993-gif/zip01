@@ -98,11 +98,13 @@ For each flushed event:
     authoritative reservation) and commit; this determines new-vs-duplicate, not Redis.
   - If new: best-effort write a Redis dedup key with TTL as a non-gating cache (a Redis outage
     here is logged and ignored), then publish the alarm with its durable `fall_warning_id` to the
-    alarm bus, then stamp `published_at` on the durable row.
+    alarm bus, then stamp `published_at` on the durable row. The `UPDATE published_at` is routed
+    through `BatchedSQLiteWriter.submit()` (when the writer is set) so the commit does not block
+    the event loop between publish and SSE delivery.
   - If the insert conflicts (`dedup_key` already present), read `published_at` from the durable
     row:
     - If `published_at IS NULL`: republish once and stamp `published_at` (guarded by
-      `published_at IS NULL`).
+      `published_at IS NULL`; also routed through `BatchedSQLiteWriter` when set).
     - If `published_at` is not null: do not republish; count as dedup on the live path, or as DB
       conflict during replay.
 

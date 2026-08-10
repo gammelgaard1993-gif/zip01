@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from datetime import datetime, timezone
@@ -12,6 +13,8 @@ from pydantic import BaseModel
 
 import config
 from api.dependencies import get_alarm_bus, get_db_connection
+
+_SSE_COMMENT = ": keep-alive\n\n"
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus, is_subscriber_disconnected
 
@@ -210,7 +213,14 @@ async def alarms_stream(
                         break
 
             while True:
-                alarm = await queue.get()
+                try:
+                    alarm = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=config.SSE_KEEPALIVE_INTERVAL_S,
+                    )
+                except asyncio.TimeoutError:
+                    yield _SSE_COMMENT
+                    continue
                 if (
                     since_iso is not None
                     and alarm.fall_warning_id is not None

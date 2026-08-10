@@ -83,5 +83,5 @@ def _ensure_events_late_column(connection: Connection) -> None:
 
 def get_db_connection(path: str = SQLITE_PATH) -> Connection:
     connection = sqlite3.connect(str(path), check_same_thread=False)
-    connection.execute("PRAGMA busy_timeout=5000;")
+    _apply_pragmas(connection)
     return connection

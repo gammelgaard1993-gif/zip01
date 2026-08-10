@@ -172,13 +172,14 @@ class RecoveryManager:
             try:
                 # Stamp the snapshot time BEFORE capturing so any event applied while the capture
                 # runs has received_at >= snapshot_ts and is therefore replayed on recovery (see
-                # _replay_events). Capture the Redis state off the event loop: SCAN + pipelined
-                # reads are still O(N) work and must not freeze ingestion or the alarm hot path.
-                # The Redis client is thread-safe, but the SQLite write stays on the loop thread
-                # so the shared connection is never used by two threads at once.
+                # _replay_events). Both the Redis capture and the SQLite write run in the executor
+                # so neither can freeze the event loop during a snapshot cycle.
                 snapshot_ts = self._current_snapshot_ts()
                 state_json = await loop.run_in_executor(self._redis_executor, self._capture_state_json)
-                self._persist_snapshot(snapshot_ts, state_json)
+                # Offload the SQLite write so the snapshot commit never freezes the event loop.
+                await loop.run_in_executor(
+                    self._redis_executor, self._persist_snapshot, snapshot_ts, state_json
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:

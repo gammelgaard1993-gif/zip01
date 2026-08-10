@@ -192,7 +192,10 @@ Side effects:
   non-gating cache, then publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus`
   for replay/live overlap reconciliation.
 - After a successful publish, stamps `fall_warnings.published_at` so replay can be idempotent
-  across restart boundaries.
+  across restart boundaries. The `UPDATE published_at` (both new-alarm and republish paths) is
+  routed through `self._writer.submit()` when `self._writer` is set, so the SQLite commit runs
+  in the `BatchedSQLiteWriter` thread rather than blocking the asyncio event loop between
+  `alarm_bus.publish()` and SSE delivery.
 - Updates alarm/dedup/conflict counters.
 
 Failure behavior:
@@ -322,9 +325,8 @@ Failure behavior:
 - Individual malformed replay rows are skipped; replay continues.
 - A snapshot with legacy presence hashes or occupancy members lacking `tie_breaker` is rejected
   together with its cutoff, forcing a full replay with deterministic equal-timestamp semantics.
-
-### `core.recovery.RecoveryManager._replay_events(since_ts)`
-
+  - The `_persist_snapshot()` call inside `_snapshot_loop` runs via `loop.run_in_executor` so
+    the SQLite write does not block the event loop during periodic snapshot captures.
 Purpose:
 
 - Re-run handlers for durable events to rebuild hot state.

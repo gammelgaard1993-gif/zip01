@@ -142,11 +142,19 @@ class FallWarnHandler:
                 fall_warning_id=lastrowid,
             )
             await self.alarm_bus.publish(alarm)
-            cursor.execute(
-                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-                (event.received_at.isoformat(), dedup_key),
-            )
-            self.db_connection.commit()
+            # Route through writer to avoid blocking the event loop with a direct commit, which
+            # would stall _dispatch_room before it can deliver to SSE subscribers.
+            if self._writer is not None:
+                await self._writer.submit(
+                    "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                    (event.received_at.isoformat(), dedup_key),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                    (event.received_at.isoformat(), dedup_key),
+                )
+                self.db_connection.commit()
             return
 
         # Best-effort cache write for fast in-process dedup visibility only; the durable insert
@@ -179,12 +187,20 @@ class FallWarnHandler:
             fall_warning_id=lastrowid,
         )
         await self.alarm_bus.publish(alarm)
-        cursor = self.db_connection.cursor()
-        cursor.execute(
-            "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-            (event.received_at.isoformat(), dedup_key),
-        )
-        self.db_connection.commit()
+        # Route through writer to avoid blocking the event loop with a direct commit, which
+        # would stall _dispatch_room before it can deliver to SSE subscribers.
+        if self._writer is not None:
+            await self._writer.submit(
+                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                (event.received_at.isoformat(), dedup_key),
+            )
+        else:
+            cursor = self.db_connection.cursor()
+            cursor.execute(
+                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                (event.received_at.isoformat(), dedup_key),
+            )
+            self.db_connection.commit()
 
     def _cache_dedup(self, dedup_key: str) -> None:
         try:

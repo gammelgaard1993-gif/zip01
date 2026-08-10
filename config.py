@@ -43,6 +43,9 @@ ALARM_REPLAY_BATCH_SIZE = 500
 # blocking delivery to other subscribers in the same room; the evicted client must reconnect
 # with `since` to resume without a gap.
 SSE_SUBSCRIBER_QUEUE_MAX_SIZE = 1_000
+# SSE keep-alive comment interval. Clients with no alarms for this many seconds would otherwise
+# time out waiting on queue.get(); a comment line keeps the TCP connection alive.
+SSE_KEEPALIVE_INTERVAL_S = 15
 
 HEARTBEAT_WINDOW_SECONDS = 300
 OCCUPANCY_WINDOW_SECONDS = 3600

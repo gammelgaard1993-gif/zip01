@@ -109,7 +109,9 @@ Shutdown sequence:
     pre-window anchor with an exclusive score boundary.
   - `FallWarnHandler`: deduplicates and persists alarms to SQLite first, publishes alarms, and
     stamps `published_at` so conflict-path replay is idempotent (republish only when a durable
-    row exists with `published_at IS NULL`).
+    row exists with `published_at IS NULL`). Both `UPDATE published_at` statements route through
+    `BatchedSQLiteWriter.submit()` when `self._writer` is set, keeping the commit off the asyncio
+    event loop so `AlarmBus._dispatch_room` tasks are not stalled before SSE delivery.
   - `GenericEventHandler`: no-op beyond persistence (already done in worker flow); handles
     `motion`, `sleep_state`, `net_status`, and is the fallback for any unmapped event type.
 

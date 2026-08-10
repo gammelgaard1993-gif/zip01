@@ -33,9 +33,13 @@ Defined in `core/db.py`:
 - `state_snapshots`
   - Periodic serialized capture of managed Redis state (`snapshot_ts`, `state_json`).
 
-The connection runs `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000` (`core/db.py`)
-so the per-event insert on the hot path avoids an fsync per commit while staying crash-safe for
-committed transactions except on OS/power loss (which snapshot + replay recovery tolerates).
+All connections — the main connection opened by `init_db()` and every connection returned by
+`get_db_connection()` (including the `BatchedSQLiteWriter`'s dedicated thread connection) — run
+`journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000` via `_apply_pragmas()` in
+`core/db.py`. Previously only the main connection applied these pragmas; the writer thread
+defaulted to `synchronous=FULL`, which triggers `FlushFileBuffers()` twice per commit on Windows.
+With the fix, every commit path avoids the extra fsync while staying crash-safe for committed
+transactions except on OS/power loss (which snapshot + replay recovery tolerates).
 
 Startup schema compatibility is enforced in `init_db`: `events.late` and
 `fall_warnings.published_at` are added for older databases using `PRAGMA table_info` checks and
@@ -57,8 +61,11 @@ Startup schema compatibility is enforced in `init_db`: `events.late` and
   to suppress replay/live overlap without missing or duplicating alarms.
 - Publish idempotency is tracked in SQLite: after successful alarm publish, the handler updates
   `published_at`; on conflict, a row with `published_at IS NULL` is republished once and then
-  stamped.
-- Commits are explicit (`db_connection.commit()`) per insertion path.
+  stamped. Both `UPDATE fall_warnings SET published_at = ?` statements route through
+  `BatchedSQLiteWriter.submit()` when `self._writer` is set, so the stamp is off the asyncio
+  event loop thread and does not block alarm dispatch to SSE subscriber queues.
+- Commits are explicit (`db_connection.commit()`) per insertion path; batched writes from
+  `BatchedSQLiteWriter` are committed by its dedicated thread.
 
 ## Snapshot Semantics
 
@@ -69,9 +76,10 @@ Startup schema compatibility is enforced in `init_db`: `events.late` and
 3. Runs periodically via background loop (default 60s).
 
 Capture uses `SCAN` (never `KEYS`, which is O(N) and blocks the whole Redis server) and a single
-pipelined batch of value reads. The periodic loop stamps `snapshot_ts` first, then runs the
-capture off the event loop (thread executor) so a large keyspace never freezes ingestion or the
-alarm hot path; the SQLite write stays on the loop thread.
+pipelined batch of value reads. The periodic loop stamps `snapshot_ts` first, then runs the capture off the event loop (thread
+executor) so a large keyspace never freezes ingestion or the alarm hot path. The SQLite snapshot
+write also runs in the executor (`loop.run_in_executor`) so a slow disk write does not block async
+work on the event loop.
 
 `snapshot_ts` is the **replay cutoff**, set to the oldest in-flight event's `received_at` at
 capture time (falling back to `now()` when nothing is in flight), not wall-clock `now()`. This
