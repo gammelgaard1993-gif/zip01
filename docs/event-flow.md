@@ -2,6 +2,18 @@
 
 ## End-to-End Path
 
+### Operational Invariants that Govern the Critical Path
+
+The runtime-critical path is the mechanism that satisfies the scoring targets. The key invariants are:
+
+- Persist-before-ack: accepted events are durably written to SQLite before the HTTP response completes, so recovery and no-silent-loss behavior are anchored in admission rather than in later processing.
+- Bounded per-device ordering: worker-side buffering reorders events for the same device by `ts` within a short window, preserving correctness for slightly late arrivals without turning the system into an unbounded buffer.
+- Staged alarm delivery: alarm latency is measured across the full path from ingestion to SSE fan-out, not only through handler execution.
+- Recovery on ingestion order: replay uses the ingestion-order cutoff (`received_at`) so late events are recovered correctly even when their device `ts` predates a snapshot.
+- Delay-based backpressure: burst traffic slows `POST /events` rather than dropping valid events, and `fall_warn` traffic is kept isolated from normal traffic.
+
+These invariants connect the scoring targets to the main requirements: correctness of health and occupancy, alarm delivery latency, recovery correctness, and burst-load handling without silent loss.
+
 ### 1) Ingestion
 
 - `POST /events` receives one flat JSON event per request (primary path).
@@ -101,10 +113,11 @@ For each flushed event:
     alarm bus, then stamp `published_at` on the durable row. The `UPDATE published_at` is routed
     through `BatchedSQLiteWriter.submit()` (when the writer is set) so the commit does not block
     the event loop between publish and SSE delivery.
-  - If the insert conflicts (`dedup_key` already present), read `published_at` from the durable
-    row:
-    - If `published_at IS NULL`: republish once and stamp `published_at` (guarded by
-      `published_at IS NULL`; also routed through `BatchedSQLiteWriter` when set).
+  - If the insert conflicts (`dedup_key` already present), read `id` and `published_at` from the
+    durable row:
+    - If `published_at IS NULL`: republish once with the durable row's `id` and stamp
+      `published_at` (guarded by `published_at IS NULL`; also routed through
+      `BatchedSQLiteWriter` when set).
     - If `published_at` is not null: do not republish; count as dedup on the live path, or as DB
       conflict during replay.
 

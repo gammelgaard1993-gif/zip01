@@ -224,9 +224,10 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
 
         await handler.handle(event)
 
-        row = self.db.execute("SELECT published_at FROM fall_warnings").fetchone()
-        self.assertIsNotNone(row[0])
+        row = self.db.execute("SELECT id, published_at FROM fall_warnings").fetchone()
+        self.assertIsNotNone(row[1])
         self.assertEqual(len(alarm_bus.published), 1)
+        self.assertEqual(alarm_bus.published[-1].fall_warning_id, row[0])
 
     async def test_generic_event_types_persist_via_admission(self) -> None:
         # Durability now happens at admission (the /events route persisting before enqueue

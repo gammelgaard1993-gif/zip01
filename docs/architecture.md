@@ -16,21 +16,15 @@ zip01 is a layered backend for high-volume sensor events.
 
 ## Operational Invariants
 
-The runtime contract is easiest to reason about if it is expressed as a small set of invariants:
+The runtime-critical path should be read as a sequence of invariants rather than as a set of loosely related modules. These invariants are the bridge between the scoring targets in the challenge contract and the main functional and non-functional requirements:
 
-1. Persist-before-ack: every accepted event is durably recorded in SQLite before the HTTP
-   response is finalized, so the durable log never lags behind admission.
-2. Per-device ordering is bounded, not absolute: the worker-side reorder buffer gives a
-   short window for late arrivals to be sorted by `ts`, but events that arrive after the flush
-   window still apply in arrival order relative to already-handled work.
-3. Alarm delivery is a staged path: worker buffering, room-level alarm buffering, and SSE fan-out
-   all contribute to the end-to-end latency budget. The scoring target is measured from server
-   ingestion to alarm dispatch, not from device `ts` to subscriber receipt.
-4. Recovery is anchored on ingestion order: late events are replayed when `received_at` falls
-   on or after the snapshot cutoff, even if their device `ts` predates the snapshot.
-5. Backpressure is delay-based, not lossy: the normal lane may slow `/events`, but the system
-   never silently drops events under burst; high-priority `fall_warn` traffic is isolated from
-   normal traffic and only backpressures when its own lane saturates.
+1. Persist-before-ack: every accepted event is durably recorded in SQLite before the HTTP response is finalized. This is the basis for restart/recovery correctness and for the no-silent-loss expectation under burst load.
+2. Bounded per-device ordering: events for the same device are processed in `ts` order within the worker reorder window. This preserves correctness for late arrivals without requiring unbounded buffering.
+3. Staged alarm delivery: alarm publication spans durable persistence, worker buffering, room-level buffering, and SSE fan-out. The 1-second p95 alarm target applies to the full path, not only handler completion.
+4. Recovery on ingestion order: replay uses the ingestion-order cutoff (`received_at`) so late events ingested after a snapshot are replayed correctly even when their device `ts` predates the snapshot.
+5. Delay-based backpressure: burst traffic may slow `POST /events`, but the system must not silently drop valid events; high-priority `fall_warn` traffic is isolated from normal traffic and only backpressures when its own lane saturates.
+
+Taken together, these invariants explain why the challenge is scored on the full path from ingestion to alarm delivery and recovery. The core functional requirements—device health, room occupancy, alarms, and recovery—are all exercised through this path, while the non-functional requirements show up as durability, bounded latency, deterministic ordering, and explicit overload behavior.
 
 ### Runtime Path at a Glance
 

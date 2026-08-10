@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import datetime, timezone
 from typing import AsyncIterator, Dict
 
 from config import ALARM_REORDER_BUFFER_MS, SSE_SUBSCRIBER_QUEUE_MAX_SIZE
 from core.metrics import increment_counter, observe_alarm_feed_latency_ms
 from models import AlarmEvent
+
+logger = logging.getLogger(__name__)
 
 
 class _SubscriberQueue(asyncio.Queue["AlarmEvent"]):
@@ -40,6 +44,20 @@ class AlarmBus:
             room_buffer = self._room_buffers.setdefault(alarm.room_id, [])
             room_buffer.append(alarm)
             room_buffer.sort(key=lambda item: item.ts)
+
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "alarm_bus_publish_received",
+                        "room_id": alarm.room_id,
+                        "device_id": alarm.device_id,
+                        "ts": alarm.ts.isoformat(),
+                        "received_at": alarm.received_at.isoformat(),
+                        "fall_warning_id": alarm.fall_warning_id,
+                        "buffer_size": len(room_buffer),
+                    }
+                )
+            )
 
             dispatch_task = self._dispatch_tasks.get(alarm.room_id)
             if dispatch_task is None or dispatch_task.done():
@@ -81,7 +99,15 @@ class AlarmBus:
     async def _dispatch_room(self, room_id: str) -> None:
         current_task = asyncio.current_task()
         try:
-            await asyncio.sleep(self._reorder_buffer_seconds)
+            async with self._lock:
+                room_buffer = self._room_buffers.get(room_id, [])
+                if not room_buffer:
+                    return
+                should_delay = len(room_buffer) > 1
+
+            if should_delay and self._reorder_buffer_seconds > 0:
+                await asyncio.sleep(self._reorder_buffer_seconds)
+
             async with self._lock:
                 room_buffer = self._room_buffers.get(room_id, [])
                 if not room_buffer:
@@ -89,6 +115,18 @@ class AlarmBus:
                 alarms_to_publish = list(room_buffer)
                 self._room_buffers[room_id] = []
                 subscriber_queues = list(self._subscribers.get(room_id, []))
+
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "alarm_bus_dispatching",
+                            "room_id": room_id,
+                            "alarm_count": len(alarms_to_publish),
+                            "subscriber_count": len(subscriber_queues),
+                            "reorder_buffer_ms": int(self._reorder_buffer_seconds * 1000),
+                        }
+                    )
+                )
 
             # Observe feed latency at dispatch time (server ingestion -> alarm surfaced to the
             # feed), independent of whether any SSE client is connected. Sampling only inside the
@@ -102,7 +140,30 @@ class AlarmBus:
                 for queue in list(subscriber_queues):
                     try:
                         queue.put_nowait(alarm)
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "alarm_bus_delivered",
+                                    "room_id": room_id,
+                                    "device_id": alarm.device_id,
+                                    "ts": alarm.ts.isoformat(),
+                                    "received_at": alarm.received_at.isoformat(),
+                                    "fall_warning_id": alarm.fall_warning_id,
+                                }
+                            )
+                        )
                     except asyncio.QueueFull:
+                        logger.warning(
+                            json.dumps(
+                                {
+                                    "event": "alarm_bus_queue_full",
+                                    "room_id": room_id,
+                                    "device_id": alarm.device_id,
+                                    "ts": alarm.ts.isoformat(),
+                                    "received_at": alarm.received_at.isoformat(),
+                                }
+                            )
+                        )
                         await self._evict_saturated_subscriber(room_id, queue)
                         subscriber_queues.remove(queue)
         finally:
@@ -115,7 +176,13 @@ class AlarmBus:
                     self._dispatch_tasks.pop(room_id, None)
 
                 if self._room_buffers.get(room_id):
-                    self._dispatch_tasks[room_id] = asyncio.create_task(self._dispatch_room(room_id))
+                    loop = None
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop is not None:
+                        self._dispatch_tasks[room_id] = loop.create_task(self._dispatch_room(room_id))
 
     async def stream(self, room_id: str) -> AsyncIterator[AlarmEvent]:
         queue = await self.subscribe(room_id)

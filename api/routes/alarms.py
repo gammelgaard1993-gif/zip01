@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from datetime import datetime, timezone
 from sqlite3 import Connection
@@ -14,11 +15,12 @@ from pydantic import BaseModel
 import config
 from api.dependencies import get_alarm_bus, get_db_connection
 
-_SSE_COMMENT = ": keep-alive\n\n"
+_SSE_COMMENT = b": keep-alive\n\n"
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus, is_subscriber_disconnected
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class AlarmListItem(BaseModel):
@@ -128,7 +130,7 @@ async def get_alarms(
     return StreamingResponse(response_body(), media_type="application/json")
 
 
-def _sse_payload(alarm: AlarmEvent) -> str:
+def _sse_payload(alarm: AlarmEvent) -> bytes:
     payload = json.dumps(
         {
             "device_id": alarm.device_id,
@@ -138,7 +140,7 @@ def _sse_payload(alarm: AlarmEvent) -> str:
             "received_at": alarm.received_at.isoformat(),
         }
     )
-    return f"data: {payload}\n\n"
+    return f"data: {payload}\n\n".encode("utf-8")
 
 
 def _persisted_sse_payload(
@@ -147,7 +149,7 @@ def _persisted_sse_payload(
     ts: str,
     confidence: float,
     received_at: str,
-) -> str:
+) -> bytes:
     payload = json.dumps(
         {
             "device_id": device_id,
@@ -157,7 +159,7 @@ def _persisted_sse_payload(
             "received_at": received_at,
         }
     )
-    return f"data: {payload}\n\n"
+    return f"data: {payload}\n\n".encode("utf-8")
 
 
 @router.get("/alarms/stream")
@@ -174,7 +176,7 @@ async def alarms_stream(
     # list while the event loop is busy sending headers.
     queue = await alarm_bus.subscribe(room_id)
 
-    async def event_generator() -> AsyncIterator[str]:
+    async def event_generator() -> AsyncIterator[bytes]:
         try:
             replay_high_water = 0
             if since_iso is not None:
@@ -207,6 +209,18 @@ async def alarms_stream(
                     )
                     rows = cursor.fetchall()
                     for row_id, device_id, row_room_id, ts, confidence, received_at in rows:
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "sse_alarm_replayed",
+                                    "room_id": room_id,
+                                    "device_id": device_id,
+                                    "ts": ts,
+                                    "received_at": received_at,
+                                    "fall_warning_id": row_id,
+                                }
+                            )
+                        )
                         yield _persisted_sse_payload(
                             device_id, row_room_id, ts, confidence, received_at
                         )
@@ -234,6 +248,19 @@ async def alarms_stream(
                 # Feed latency is observed centrally in AlarmBus._dispatch_room (at dispatch time),
                 # so it is measured even when no SSE client is connected. Sampling here as well
                 # would double-count, so the stream only delivers frames.
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "sse_alarm_emitted",
+                            "room_id": room_id,
+                            "device_id": alarm.device_id,
+                            "ts": alarm.ts.isoformat(),
+                            "received_at": alarm.received_at.isoformat(),
+                            "fall_warning_id": alarm.fall_warning_id,
+                            "queue_age_ms": int((datetime.now(timezone.utc) - alarm.received_at).total_seconds() * 1000),
+                        }
+                    )
+                )
                 yield _sse_payload(alarm)
                 if is_subscriber_disconnected(queue):
                     # Evicted for being saturated: no further alarms will arrive on this queue.

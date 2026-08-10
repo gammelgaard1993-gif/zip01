@@ -28,6 +28,61 @@ class _AlarmPublisher(Protocol):
         ...
 
 
+class _AlarmDeliveryCoordinator:
+    def __init__(
+        self,
+        db_connection: Connection,
+        alarm_bus: _AlarmPublisher,
+        writer: "BatchedSQLiteWriter | None" = None,
+    ) -> None:
+        self.db_connection = db_connection
+        self.alarm_bus = alarm_bus
+        self._writer = writer
+
+    async def publish(
+        self,
+        event: ValidatedEvent,
+        dedup_key: str,
+        confidence: float,
+        warning_id: int | None,
+    ) -> None:
+        alarm = AlarmEvent(
+            device_id=event.device_id,
+            room_id=event.room_id,
+            ts=event.ts,
+            confidence=confidence,
+            received_at=event.received_at,
+            fall_warning_id=warning_id,
+        )
+        logger.info(
+            json.dumps(
+                {
+                    "event": "fall_warn_publish_attempt",
+                    "device_id": alarm.device_id,
+                    "room_id": alarm.room_id,
+                    "ts": alarm.ts.isoformat(),
+                    "received_at": alarm.received_at.isoformat(),
+                    "fall_warning_id": alarm.fall_warning_id,
+                    "dedup_key": dedup_key,
+                }
+            )
+        )
+        await self.alarm_bus.publish(alarm)
+        published_at = event.received_at.isoformat()
+        if self._writer is not None:
+            await self._writer.submit(
+                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                (published_at, dedup_key),
+            )
+        else:
+            cursor = self.db_connection.cursor()
+            cursor.execute(
+                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
+                (published_at, dedup_key),
+            )
+            self.db_connection.commit()
+
+
 class FallWarnHandler:
     def __init__(
         self,
@@ -41,6 +96,11 @@ class FallWarnHandler:
         self.redis: _DedupRedis = cast(_DedupRedis, redis_client)
         self.db_connection: Connection = db_connection
         self.alarm_bus: _AlarmPublisher = alarm_bus
+        self._delivery = _AlarmDeliveryCoordinator(
+            db_connection=db_connection,
+            alarm_bus=alarm_bus,
+            writer=writer,
+        )
         # When True this handler is re-applying durable history during recovery, so a SQLite
         # UNIQUE no-op is an expected replay artifact rather than a real duplicate detection.
         self.replay: bool = replay
@@ -90,9 +150,28 @@ class FallWarnHandler:
 
         if rowcount == 0:
             cursor = self.db_connection.cursor()
-            cursor.execute("SELECT published_at FROM fall_warnings WHERE dedup_key = ?", (dedup_key,))
+            cursor.execute(
+                "SELECT id, published_at FROM fall_warnings WHERE dedup_key = ?",
+                (dedup_key,),
+            )
             row = cursor.fetchone()
-            published_at = row[0] if row is not None else None
+            existing_row_id = int(row[0]) if row is not None and row[0] is not None else None
+            published_at = row[1] if row is not None else None
+
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "fall_warn_duplicate_or_republish",
+                        "device_id": event.device_id,
+                        "room_id": event.room_id,
+                        "dedup_key": dedup_key,
+                        "ts": event.ts.isoformat(),
+                        "received_at": event.received_at.isoformat(),
+                        "published_at": published_at,
+                        "replay": self.replay,
+                    }
+                )
+            )
 
             # SQLite already holds a row for this dedup_key. Two situations reach here:
             #  - Recovery replay / crash recovery: the durable row exists but has not yet been
@@ -133,28 +212,12 @@ class FallWarnHandler:
                 )
             )
 
-            alarm = AlarmEvent(
-                device_id=event.device_id,
-                room_id=event.room_id,
-                ts=event.ts,
-                confidence=confidence,
-                received_at=event.received_at,
-                fall_warning_id=lastrowid,
+            await self._delivery.publish(
+                event,
+                dedup_key,
+                confidence,
+                existing_row_id,
             )
-            await self.alarm_bus.publish(alarm)
-            # Route through writer to avoid blocking the event loop with a direct commit, which
-            # would stall _dispatch_room before it can deliver to SSE subscribers.
-            if self._writer is not None:
-                await self._writer.submit(
-                    "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-                    (event.received_at.isoformat(), dedup_key),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-                    (event.received_at.isoformat(), dedup_key),
-                )
-                self.db_connection.commit()
             return
 
         # Best-effort cache write for fast in-process dedup visibility only; the durable insert
@@ -174,33 +237,21 @@ class FallWarnHandler:
                     "device_id": event.device_id,
                     "room_id": event.room_id,
                     "dedup": False,
+                    "dedup_key": dedup_key,
+                    "ts": event.ts.isoformat(),
+                    "received_at": event.received_at.isoformat(),
+                    "fall_warning_id": lastrowid,
                 }
             )
         )
 
-        alarm = AlarmEvent(
-            device_id=event.device_id,
-            room_id=event.room_id,
-            ts=event.ts,
-            confidence=confidence,
-            received_at=event.received_at,
-            fall_warning_id=lastrowid,
+        warning_id = int(lastrowid) if lastrowid is not None else None
+        await self._delivery.publish(
+            event,
+            dedup_key,
+            confidence,
+            warning_id,
         )
-        await self.alarm_bus.publish(alarm)
-        # Route through writer to avoid blocking the event loop with a direct commit, which
-        # would stall _dispatch_room before it can deliver to SSE subscribers.
-        if self._writer is not None:
-            await self._writer.submit(
-                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-                (event.received_at.isoformat(), dedup_key),
-            )
-        else:
-            cursor = self.db_connection.cursor()
-            cursor.execute(
-                "UPDATE fall_warnings SET published_at = ? WHERE dedup_key = ? AND published_at IS NULL",
-                (event.received_at.isoformat(), dedup_key),
-            )
-            self.db_connection.commit()
 
     def _cache_dedup(self, dedup_key: str) -> None:
         try:

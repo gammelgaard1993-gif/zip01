@@ -5,10 +5,11 @@ import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, cast
+from typing import Any, AsyncIterator, cast
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
 from api.routes.alarms import alarms_stream, get_alarms
 from core.metrics import get_counters
@@ -16,12 +17,15 @@ from models import AlarmEvent
 from processing.alarm_bus import AlarmBus
 
 
-async def _next_chunk(iterator: AsyncIterator[str]) -> str:
-    return await anext(iterator)
+async def _next_chunk(iterator: AsyncIterator[object]) -> str:
+    chunk = await anext(iterator)
+    if isinstance(chunk, bytes):
+        return chunk.decode("utf-8")
+    return str(chunk)
 
 
-async def _json_response(response: object) -> dict[str, object]:
-    iterator = cast(AsyncIterator[str], cast(object, response).body_iterator)
+async def _json_response(response: StreamingResponse) -> dict[str, object]:
+    iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
     chunks = [chunk async for chunk in iterator]
     return cast(dict[str, object], json.loads("".join(chunks)))
 
@@ -135,7 +139,7 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         self.db.commit()
 
         response = await get_alarms(since=0.0, room_id="room_1", db_connection=self.db)
-        iterator = cast(AsyncIterator[str], response.body_iterator)
+        iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
         self.assertEqual(await _next_chunk(iterator), '{"alarms":[')
         first_alarm = await _next_chunk(iterator)
         self.assertIn('"device_id":"dev_existing"', first_alarm)
@@ -170,7 +174,7 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
             alarm_bus=alarm_bus,
         )
 
-        iterator = cast(AsyncIterator[str], response.body_iterator)
+        iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
 
         first_chunk = await asyncio.wait_for(_next_chunk(iterator), timeout=1.0)
         self.assertIn('"device_id": "dev_replay"', first_chunk)
@@ -236,7 +240,7 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
             db_connection=self.db,
             alarm_bus=alarm_bus,
         )
-        iterator = cast(AsyncIterator[str], response.body_iterator)
+        iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
 
         first = await asyncio.wait_for(_next_chunk(iterator), timeout=1.0)
         self.assertIn('"device_id": "dev_race"', first)
@@ -282,12 +286,12 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
                 db_connection=self.db,
                 alarm_bus=alarm_bus,
             )
-            iterator = cast(AsyncIterator[str], response.body_iterator)
+            iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
             chunks = [
                 await asyncio.wait_for(_next_chunk(iterator), timeout=1.0)
                 for _ in rows
             ]
-            await iterator.aclose()
+            await cast(Any, iterator).aclose()
 
         self.assertEqual(
             [json.loads(chunk.removeprefix("data: ").strip())["device_id"] for chunk in chunks],
@@ -326,6 +330,32 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         # Evicted (capped at the bound) rather than grown to hold all 5 published alarms.
         self.assertLessEqual(stalled_queue.qsize(), 2)
 
+    async def test_alarm_stream_delivers_without_waiting_for_reorder_window(self) -> None:
+        with patch("processing.alarm_bus.ALARM_REORDER_BUFFER_MS", 500):
+            alarm_bus = AlarmBus()
+            room_id = "room_immediate"
+
+            response = await alarms_stream(
+                room_id=room_id, since=None, db_connection=self.db, alarm_bus=alarm_bus
+            )
+            iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
+
+            first_chunk_task = asyncio.create_task(_next_chunk(iterator))
+            await asyncio.sleep(0.05)
+
+            await alarm_bus.publish(
+                AlarmEvent(
+                    device_id="dev_immediate",
+                    room_id=room_id,
+                    ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+                    confidence=0.95,
+                    received_at=datetime.now(timezone.utc),
+                )
+            )
+
+            chunk = await asyncio.wait_for(first_chunk_task, timeout=0.2)
+            self.assertIn('"device_id": "dev_immediate"', chunk)
+
     async def test_alarm_stream_closes_after_subscriber_is_evicted(self) -> None:
         # The SSE route's consume loop must eventually close the connection for an evicted,
         # fully-drained subscriber instead of looping on a queue that will never receive anything
@@ -337,7 +367,7 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
             response = await alarms_stream(
                 room_id=room_id, since=None, db_connection=self.db, alarm_bus=alarm_bus
             )
-            iterator = cast(AsyncIterator[str], response.body_iterator)
+            iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
 
             # The generator subscribes lazily on first iteration, so it must be pumped once
             # (subscribing it) before publishing -- otherwise the burst below would have no

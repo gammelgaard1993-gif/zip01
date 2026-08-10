@@ -191,8 +191,9 @@ Side effects:
 - On a newly-inserted row, best-effort writes a Redis dedup key with TTL (`config.py`) as a
   non-gating cache, then publishes `AlarmEvent` with the committed `fall_warning_id` to `AlarmBus`
   for replay/live overlap reconciliation.
-- After a successful publish, stamps `fall_warnings.published_at` so replay can be idempotent
-  across restart boundaries. The `UPDATE published_at` (both new-alarm and republish paths) is
+- When the insert conflicts and the durable row still has `published_at IS NULL`, the handler
+  republishes once using that durable row's `id` and stamps `published_at` so recovery and later
+  retries cannot loop forever. The `UPDATE published_at` (both new-alarm and republish paths) is
   routed through `self._writer.submit()` when `self._writer` is set, so the SQLite commit runs
   in the `BatchedSQLiteWriter` thread rather than blocking the asyncio event loop between
   `alarm_bus.publish()` and SSE delivery.
