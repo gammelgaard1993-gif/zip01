@@ -195,6 +195,103 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         live_payload = json.loads(second_chunk.removeprefix("data: ").strip())
         self.assertEqual(live_payload["room_id"], room_id)
 
+    async def test_alarm_bus_replays_current_dispatch_batch_to_late_subscribers(self) -> None:
+        class PausingAlarmBus(AlarmBus):
+            def __init__(self) -> None:
+                super().__init__()
+                self._release_delivery = asyncio.Event()
+                self._delivery_started = asyncio.Event()
+
+            async def wait_for_delivery_started(self) -> None:
+                await self._delivery_started.wait()
+
+            def release_delivery(self) -> None:
+                self._release_delivery.set()
+
+            def seed_room_buffer(self, room_id: str, alarms: list[AlarmEvent]) -> None:
+                self._room_buffers[room_id] = list(alarms)
+
+            async def _dispatch_room(self, room_id: str) -> None:
+                current_task = asyncio.current_task()
+                try:
+                    async with self._lock:
+                        room_buffer = self._room_buffers.get(room_id, [])
+                        if not room_buffer:
+                            return
+                        alarms_to_publish = list(room_buffer)
+                        self._room_buffers[room_id] = []
+                        self._inflight_batches[room_id] = alarms_to_publish
+                        self._delivery_started.set()
+
+                    await self._release_delivery.wait()
+
+                    async with self._lock:
+                        subscriber_queues = list(self._subscribers.get(room_id, []))
+
+                    for alarm in alarms_to_publish:
+                        for queue in list(subscriber_queues):
+                            queue.put_nowait(alarm)
+                finally:
+                    async with self._lock:
+                        self._inflight_batches.pop(room_id, None)
+                        mapped_task = self._dispatch_tasks.get(room_id)
+                        if mapped_task is current_task:
+                            self._dispatch_tasks.pop(room_id, None)
+
+        alarm_bus: PausingAlarmBus = PausingAlarmBus()
+        room_id = "room_late_subscriber"
+        alarm = AlarmEvent(
+            device_id="dev_late",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 14, 30, 0, tzinfo=timezone.utc),
+            confidence=0.95,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        await alarm_bus.publish(alarm)
+        await asyncio.wait_for(alarm_bus.wait_for_delivery_started(), timeout=1.0)
+
+        queue = await alarm_bus.subscribe(room_id)
+        alarm_bus.release_delivery()
+
+        received = await asyncio.wait_for(queue.get(), timeout=1.0)
+        self.assertEqual(received.device_id, alarm.device_id)
+
+    async def test_replay_to_full_subscriber_queue_is_buffered_until_drained(self) -> None:
+        class SeedableAlarmBus(AlarmBus):
+            def seed_room_buffer(self, room_id: str, alarms: list[AlarmEvent]) -> None:
+                self._room_buffers[room_id] = list(alarms)
+
+        with patch("processing.alarm_bus.SSE_SUBSCRIBER_QUEUE_MAX_SIZE", 1):
+            alarm_bus: SeedableAlarmBus = SeedableAlarmBus()
+            room_id = "room_buffered_replay"
+            first_alarm = AlarmEvent(
+                device_id="dev_buffered_1",
+                room_id=room_id,
+                ts=datetime(2026, 6, 29, 19, 0, 0, tzinfo=timezone.utc),
+                confidence=0.9,
+                received_at=datetime.now(timezone.utc),
+            )
+            second_alarm = AlarmEvent(
+                device_id="dev_buffered_2",
+                room_id=room_id,
+                ts=datetime(2026, 6, 29, 19, 0, 1, tzinfo=timezone.utc),
+                confidence=0.95,
+                received_at=datetime.now(timezone.utc),
+            )
+            alarm_bus.seed_room_buffer(room_id, [first_alarm, second_alarm])
+
+            queue = cast(Any, await alarm_bus.subscribe(room_id))
+
+            self.assertEqual(queue.qsize(), 1)
+            self.assertGreaterEqual(queue.pending_count(), 2)
+
+            first = await asyncio.wait_for(queue.get(), timeout=1.0)
+            self.assertEqual(first.device_id, first_alarm.device_id)
+
+            second = await asyncio.wait_for(queue.get(), timeout=1.0)
+            self.assertEqual(second.device_id, second_alarm.device_id)
+
     async def test_alarm_stream_invalid_since_returns_400(self) -> None:
         alarm_bus = AlarmBus()
         with self.assertRaises(HTTPException) as ctx:

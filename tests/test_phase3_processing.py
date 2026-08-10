@@ -207,6 +207,20 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row_count, 1)
         self.assertEqual(len(alarm_bus.published), 1)
 
+    async def test_worker_pool_delivers_fall_warns_to_handler(self) -> None:
+        queue = PriorityEventQueue(20)
+        alarm_bus = FakeAlarmBus()
+        pool = WorkerPool(queue, cast(Any, alarm_bus), self.db, cast(Any, FakeRedis()))
+        event = self._event("fall_warn", payload={"confidence": 0.95}, ts=datetime.now(timezone.utc))
+
+        await pool.start()
+        await queue.put(event)
+        await asyncio.sleep(0.4)
+        await pool.stop()
+
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM fall_warnings").fetchone()[0], 1)
+        self.assertEqual(len(alarm_bus.published), 1)
+
     async def test_fall_warn_recovery_republishes_unpublished_row_once(self) -> None:
         event = self._event("fall_warn", payload={"confidence": 0.95}, ts=datetime.now(timezone.utc))
         seed_alarm_bus = FakeAlarmBus()

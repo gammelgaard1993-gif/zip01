@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from typing import AsyncIterator, Dict
 
@@ -14,27 +15,60 @@ logger = logging.getLogger(__name__)
 
 
 class _SubscriberQueue(asyncio.Queue["AlarmEvent"]):
-    """A per-subscriber alarm queue that also carries its own eviction signal.
+    """A per-subscriber alarm queue with explicit state and bounded replay buffering.
 
-    Bounded so one stalled/slow SSE client cannot grow memory without limit or block fan-out to
-    other subscribers in the same room; once full it is evicted (see `AlarmBus._dispatch_room`)
-    and `disconnected` is set so the owning stream can close once it drains any buffered alarms.
+    The main queue is bounded so one stalled/slow SSE client cannot grow memory without limit or
+    block fan-out to other subscribers in the same room. When the queue is full, replayed alarms
+    are buffered in a small backlog instead of being dropped; once that backlog is also saturated,
+    the subscriber is evicted and marked disconnected so the stream can close after draining.
     """
 
     def __init__(self) -> None:
         super().__init__(maxsize=SSE_SUBSCRIBER_QUEUE_MAX_SIZE)
+        self._backlog: deque[AlarmEvent] = deque()
         self.disconnected = asyncio.Event()
+        self.state = "active"
+
+    def put_nowait(self, item: AlarmEvent) -> None:
+        if not self.full():
+            super().put_nowait(item)
+            return
+
+        if len(self._backlog) >= SSE_SUBSCRIBER_QUEUE_MAX_SIZE:
+            raise asyncio.QueueFull
+
+        self._backlog.append(item)
+
+    def pending_count(self) -> int:
+        return self.qsize() + len(self._backlog)
+
+    def drain_backlog(self) -> None:
+        while not self.full() and self._backlog:
+            super().put_nowait(self._backlog.popleft())
+
+    async def get(self) -> AlarmEvent:
+        self.drain_backlog()
+        return await super().get()
+
+    def mark_evicted(self) -> None:
+        self.state = "evicted"
+        self.disconnected.set()
 
 
 def is_subscriber_disconnected(queue: "asyncio.Queue[AlarmEvent]") -> bool:
     """True once a subscriber queue has been evicted and fully drained."""
-    return isinstance(queue, _SubscriberQueue) and queue.disconnected.is_set() and queue.empty()
+    return (
+        isinstance(queue, _SubscriberQueue)
+        and queue.state == "evicted"
+        and queue.pending_count() == 0
+    )
 
 
 class AlarmBus:
     def __init__(self) -> None:
         self._subscribers: Dict[str, list[asyncio.Queue[AlarmEvent]]] = {}
         self._room_buffers: Dict[str, list[AlarmEvent]] = {}
+        self._inflight_batches: Dict[str, list[AlarmEvent]] = {}
         self._dispatch_tasks: Dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
         self._reorder_buffer_seconds = ALARM_REORDER_BUFFER_MS / 1000.0
@@ -68,7 +102,12 @@ class AlarmBus:
         async with self._lock:
             self._subscribers.setdefault(room_id, []).append(queue)
             # Replay alarms already buffered but not yet dispatched so a subscriber that
-            # arrives after publish() but before _dispatch_room snapshot doesn't miss them.
+            # arrives after publish() but before the room dispatch completes doesn't miss them.
+            for alarm in self._inflight_batches.get(room_id, []):
+                try:
+                    queue.put_nowait(alarm)
+                except asyncio.QueueFull:
+                    break
             for alarm in self._room_buffers.get(room_id, []):
                 try:
                     queue.put_nowait(alarm)
@@ -93,7 +132,7 @@ class AlarmBus:
         # `since` to resume without a gap.
         await self.unsubscribe(room_id, queue)
         if isinstance(queue, _SubscriberQueue):
-            queue.disconnected.set()
+            queue.mark_evicted()
         increment_counter("sse_subscribers_evicted")
 
     async def _dispatch_room(self, room_id: str) -> None:
@@ -103,19 +142,16 @@ class AlarmBus:
                 room_buffer = self._room_buffers.get(room_id, [])
                 if not room_buffer:
                     return
-                should_delay = len(room_buffer) > 1
+                alarms_to_publish = list(room_buffer)
+                self._room_buffers[room_id] = []
+                self._inflight_batches[room_id] = alarms_to_publish
+                should_delay = len(alarms_to_publish) > 1
 
             if should_delay and self._reorder_buffer_seconds > 0:
                 await asyncio.sleep(self._reorder_buffer_seconds)
 
             async with self._lock:
-                room_buffer = self._room_buffers.get(room_id, [])
-                if not room_buffer:
-                    return
-                alarms_to_publish = list(room_buffer)
-                self._room_buffers[room_id] = []
                 subscriber_queues = list(self._subscribers.get(room_id, []))
-
                 logger.info(
                     json.dumps(
                         {
@@ -171,6 +207,7 @@ class AlarmBus:
             # locked "create only if no task or task.done()" check can never observe a
             # gap and schedule a second dispatch task for this room.
             async with self._lock:
+                self._inflight_batches.pop(room_id, None)
                 mapped_task = self._dispatch_tasks.get(room_id)
                 if mapped_task is current_task:
                     self._dispatch_tasks.pop(room_id, None)
