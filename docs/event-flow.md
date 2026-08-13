@@ -65,7 +65,7 @@ These invariants connect the scoring targets to the main requirements: correctne
   `fall_warn` never waits behind a NORMAL backlog already routed to that worker, and the lane
   cannot grow unbounded (a full NORMAL lane backpressures the router).
 - Worker stores events in a per-device buffer and sorts by event `ts`.
-- Flush task waits the reorder window (`DEVICE_REORDER_BUFFER_MS`, 100ms), then processes oldest first.
+- Flush task waits the reorder window (`DEVICE_REORDER_BUFFER_MS`, 10ms), then processes oldest first.
 - **Ordering contract is bounded, not unconditional**: strict `ts` apply-order only holds for
   events that arrive within the same `DEVICE_REORDER_BUFFER_MS` window. An event arriving after
   its device's buffer already flushed (arbitrarily late, e.g. an offline device catching up) is
@@ -130,7 +130,7 @@ For each flushed event:
 1. `fall_warn` accepted by handler.
 2. Alarm persisted to SQLite.
 3. Alarm published to in-memory room buffer in alarm bus.
-4. Alarm bus dispatches after reorder delay (`ALARM_REORDER_BUFFER_MS`, 100ms) to each
+4. Alarm bus dispatches after reorder delay (`ALARM_REORDER_BUFFER_MS`, 10ms) to each
    subscriber queue (bounded, `SSE_SUBSCRIBER_QUEUE_MAX_SIZE`). A subscriber whose queue is full
    (stalled/slow client) is evicted (`sse_subscribers_evicted`) instead of blocking dispatch to
    the room's other subscribers; once drained, that client's stream closes and it must reconnect

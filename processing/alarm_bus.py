@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict
 
 from config import ALARM_REORDER_BUFFER_MS, SSE_SUBSCRIBER_QUEUE_MAX_SIZE
-from core.metrics import increment_counter, observe_alarm_feed_latency_ms
+from core.metrics import (
+    increment_counter,
+    observe_alarm_feed_latency_ms,
+    observe_alarm_path_stage_latency_ms,
+)
 from models import AlarmEvent
 
 logger = logging.getLogger(__name__)
@@ -77,21 +81,21 @@ class AlarmBus:
         async with self._lock:
             room_buffer = self._room_buffers.setdefault(alarm.room_id, [])
             room_buffer.append(alarm)
-            room_buffer.sort(key=lambda item: item.ts)
 
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "alarm_bus_publish_received",
-                        "room_id": alarm.room_id,
-                        "device_id": alarm.device_id,
-                        "ts": alarm.ts.isoformat(),
-                        "received_at": alarm.received_at.isoformat(),
-                        "fall_warning_id": alarm.fall_warning_id,
-                        "buffer_size": len(room_buffer),
-                    }
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    json.dumps(
+                        {
+                            "event": "alarm_bus_publish_received",
+                            "room_id": alarm.room_id,
+                            "device_id": alarm.device_id,
+                            "ts": alarm.ts.isoformat(),
+                            "received_at": alarm.received_at.isoformat(),
+                            "fall_warning_id": alarm.fall_warning_id,
+                            "buffer_size": len(room_buffer),
+                        }
+                    )
                 )
-            )
 
             dispatch_task = self._dispatch_tasks.get(alarm.room_id)
             if dispatch_task is None or dispatch_task.done():
@@ -142,9 +146,10 @@ class AlarmBus:
                 room_buffer = self._room_buffers.get(room_id, [])
                 if not room_buffer:
                     return
-                alarms_to_publish = list(room_buffer)
+                alarms_to_publish = sorted(room_buffer, key=lambda item: item.ts)
                 self._room_buffers[room_id] = []
                 self._inflight_batches[room_id] = alarms_to_publish
+                subscriber_queues = list(self._subscribers.get(room_id, []))
                 should_delay = len(alarms_to_publish) > 1
 
             if should_delay and self._reorder_buffer_seconds > 0:
@@ -152,17 +157,18 @@ class AlarmBus:
 
             async with self._lock:
                 subscriber_queues = list(self._subscribers.get(room_id, []))
-                logger.info(
-                    json.dumps(
-                        {
-                            "event": "alarm_bus_dispatching",
-                            "room_id": room_id,
-                            "alarm_count": len(alarms_to_publish),
-                            "subscriber_count": len(subscriber_queues),
-                            "reorder_buffer_ms": int(self._reorder_buffer_seconds * 1000),
-                        }
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        json.dumps(
+                            {
+                                "event": "alarm_bus_dispatching",
+                                "room_id": room_id,
+                                "alarm_count": len(alarms_to_publish),
+                                "subscriber_count": len(subscriber_queues),
+                                "reorder_buffer_ms": int(self._reorder_buffer_seconds * 1000),
+                            }
+                        )
                     )
-                )
 
             # Observe feed latency at dispatch time (server ingestion -> alarm surfaced to the
             # feed), independent of whether any SSE client is connected. Sampling only inside the
@@ -171,23 +177,28 @@ class AlarmBus:
             dispatch_now = datetime.now(timezone.utc)
             for alarm in alarms_to_publish:
                 observe_alarm_feed_latency_ms((dispatch_now - alarm.received_at).total_seconds() * 1000.0)
+                observe_alarm_path_stage_latency_ms(
+                    "alarm_bus_dispatch",
+                    (dispatch_now - alarm.received_at).total_seconds() * 1000.0,
+                )
 
             for alarm in alarms_to_publish:
                 for queue in list(subscriber_queues):
                     try:
                         queue.put_nowait(alarm)
-                        logger.info(
-                            json.dumps(
-                                {
-                                    "event": "alarm_bus_delivered",
-                                    "room_id": room_id,
-                                    "device_id": alarm.device_id,
-                                    "ts": alarm.ts.isoformat(),
-                                    "received_at": alarm.received_at.isoformat(),
-                                    "fall_warning_id": alarm.fall_warning_id,
-                                }
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                json.dumps(
+                                    {
+                                        "event": "alarm_bus_delivered",
+                                        "room_id": room_id,
+                                        "device_id": alarm.device_id,
+                                        "ts": alarm.ts.isoformat(),
+                                        "received_at": alarm.received_at.isoformat(),
+                                        "fall_warning_id": alarm.fall_warning_id,
+                                    }
+                                )
                             )
-                        )
                     except asyncio.QueueFull:
                         logger.warning(
                             json.dumps(

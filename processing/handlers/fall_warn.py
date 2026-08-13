@@ -54,19 +54,20 @@ class _AlarmDeliveryCoordinator:
             received_at=event.received_at,
             fall_warning_id=warning_id,
         )
-        logger.info(
-            json.dumps(
-                {
-                    "event": "fall_warn_publish_attempt",
-                    "device_id": alarm.device_id,
-                    "room_id": alarm.room_id,
-                    "ts": alarm.ts.isoformat(),
-                    "received_at": alarm.received_at.isoformat(),
-                    "fall_warning_id": alarm.fall_warning_id,
-                    "dedup_key": dedup_key,
-                }
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                json.dumps(
+                    {
+                        "event": "fall_warn_publish_attempt",
+                        "device_id": alarm.device_id,
+                        "room_id": alarm.room_id,
+                        "ts": alarm.ts.isoformat(),
+                        "received_at": alarm.received_at.isoformat(),
+                        "fall_warning_id": alarm.fall_warning_id,
+                        "dedup_key": dedup_key,
+                    }
+                )
             )
-        )
         await self.alarm_bus.publish(alarm)
         published_at = event.received_at.isoformat()
         if self._writer is not None:
@@ -158,20 +159,21 @@ class FallWarnHandler:
             existing_row_id = int(row[0]) if row is not None and row[0] is not None else None
             published_at = row[1] if row is not None else None
 
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "fall_warn_duplicate_or_republish",
-                        "device_id": event.device_id,
-                        "room_id": event.room_id,
-                        "dedup_key": dedup_key,
-                        "ts": event.ts.isoformat(),
-                        "received_at": event.received_at.isoformat(),
-                        "published_at": published_at,
-                        "replay": self.replay,
-                    }
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    json.dumps(
+                        {
+                            "event": "fall_warn_duplicate_or_republish",
+                            "device_id": event.device_id,
+                            "room_id": event.room_id,
+                            "dedup_key": dedup_key,
+                            "ts": event.ts.isoformat(),
+                            "received_at": event.received_at.isoformat(),
+                            "published_at": published_at,
+                            "replay": self.replay,
+                        }
+                    )
                 )
-            )
 
             # SQLite already holds a row for this dedup_key. Two situations reach here:
             #  - Recovery replay / crash recovery: the durable row exists but has not yet been
@@ -201,16 +203,17 @@ class FallWarnHandler:
                 )
                 return
 
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "fall_warn_republish",
-                        "device_id": event.device_id,
-                        "room_id": event.room_id,
-                        "dedup": False,
-                    }
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    json.dumps(
+                        {
+                            "event": "fall_warn_republish",
+                            "device_id": event.device_id,
+                            "room_id": event.room_id,
+                            "dedup": False,
+                        }
+                    )
                 )
-            )
 
             await self._delivery.publish(
                 event,
@@ -230,20 +233,21 @@ class FallWarnHandler:
             self._cache_dedup(dedup_key)
 
         increment_counter("fall_warnings_total")
-        logger.info(
-            json.dumps(
-                {
-                    "event": "fall_warn",
-                    "device_id": event.device_id,
-                    "room_id": event.room_id,
-                    "dedup": False,
-                    "dedup_key": dedup_key,
-                    "ts": event.ts.isoformat(),
-                    "received_at": event.received_at.isoformat(),
-                    "fall_warning_id": lastrowid,
-                }
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                json.dumps(
+                    {
+                        "event": "fall_warn",
+                        "device_id": event.device_id,
+                        "room_id": event.room_id,
+                        "dedup": False,
+                        "dedup_key": dedup_key,
+                        "ts": event.ts.isoformat(),
+                        "received_at": event.received_at.isoformat(),
+                        "fall_warning_id": lastrowid,
+                    }
+                )
             )
-        )
 
         warning_id = int(lastrowid) if lastrowid is not None else None
         await self._delivery.publish(

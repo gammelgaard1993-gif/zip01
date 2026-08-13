@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from api.routes.alarms import alarms_stream, get_alarms
-from core.metrics import get_counters
+from core.metrics import get_alarm_path_stage_latency_ms_p95, get_counters
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus
 
@@ -292,6 +292,35 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
             second = await asyncio.wait_for(queue.get(), timeout=1.0)
             self.assertEqual(second.device_id, second_alarm.device_id)
 
+    async def test_alarm_stream_records_sse_delivery_latency(self) -> None:
+        alarm_bus = AlarmBus()
+        room_id = "room_latency_trace"
+
+        response = await alarms_stream(
+            room_id=room_id,
+            since=None,
+            db_connection=self.db,
+            alarm_bus=alarm_bus,
+        )
+        iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
+
+        first_chunk_task = asyncio.create_task(_next_chunk(iterator))
+        await asyncio.sleep(0.05)
+
+        await alarm_bus.publish(
+            AlarmEvent(
+                device_id="dev_latency_trace",
+                room_id=room_id,
+                ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+                confidence=0.95,
+                received_at=datetime.now(timezone.utc),
+            )
+        )
+
+        chunk = await asyncio.wait_for(first_chunk_task, timeout=0.5)
+        self.assertIn('"device_id": "dev_latency_trace"', chunk)
+        self.assertGreaterEqual(get_alarm_path_stage_latency_ms_p95("sse_delivery"), 0)
+
     async def test_alarm_stream_invalid_since_returns_400(self) -> None:
         alarm_bus = AlarmBus()
         with self.assertRaises(HTTPException) as ctx:
@@ -427,6 +456,24 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         # Evicted (capped at the bound) rather than grown to hold all 5 published alarms.
         self.assertLessEqual(stalled_queue.qsize(), 2)
 
+    async def test_publish_delivers_to_active_subscribers_without_waiting_for_dispatch_cycle(self) -> None:
+        alarm_bus = AlarmBus()
+        room_id = "room_immediate_publish"
+        queue = await alarm_bus.subscribe(room_id)
+
+        alarm = AlarmEvent(
+            device_id="dev_immediate_publish",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+            confidence=0.95,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        await alarm_bus.publish(alarm)
+        received = await asyncio.wait_for(queue.get(), timeout=0.05)
+
+        self.assertEqual(received.device_id, alarm.device_id)
+
     async def test_alarm_stream_delivers_without_waiting_for_reorder_window(self) -> None:
         with patch("processing.alarm_bus.ALARM_REORDER_BUFFER_MS", 500):
             alarm_bus = AlarmBus()
@@ -452,6 +499,40 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
 
             chunk = await asyncio.wait_for(first_chunk_task, timeout=0.2)
             self.assertIn('"device_id": "dev_immediate"', chunk)
+
+    async def test_alarm_stream_delivers_bursts_without_waiting_for_reorder_window(self) -> None:
+        with patch("processing.alarm_bus.ALARM_REORDER_BUFFER_MS", 300):
+            alarm_bus = AlarmBus()
+            room_id = "room_burst"
+
+            response = await alarms_stream(
+                room_id=room_id, since=None, db_connection=self.db, alarm_bus=alarm_bus
+            )
+            iterator = cast(AsyncIterator[str], cast(Any, response).body_iterator)
+
+            first_chunk_task = asyncio.create_task(_next_chunk(iterator))
+            await asyncio.sleep(0.05)
+
+            first_alarm = AlarmEvent(
+                device_id="dev_burst_first",
+                room_id=room_id,
+                ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+                confidence=0.92,
+                received_at=datetime.now(timezone.utc),
+            )
+            second_alarm = AlarmEvent(
+                device_id="dev_burst_second",
+                room_id=room_id,
+                ts=datetime(2026, 6, 29, 18, 0, 1, tzinfo=timezone.utc),
+                confidence=0.94,
+                received_at=datetime.now(timezone.utc),
+            )
+
+            await alarm_bus.publish(first_alarm)
+            await alarm_bus.publish(second_alarm)
+
+            chunk = await asyncio.wait_for(first_chunk_task, timeout=0.5)
+            self.assertIn('"device_id": "dev_burst_first"', chunk)
 
     async def test_alarm_stream_closes_after_subscriber_is_evicted(self) -> None:
         # The SSE route's consume loop must eventually close the connection for an evicted,

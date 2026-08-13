@@ -198,6 +198,10 @@ Side effects:
   in the `BatchedSQLiteWriter` thread rather than blocking the asyncio event loop between
   `alarm_bus.publish()` and SSE delivery.
 - Updates alarm/dedup/conflict counters.
+- Records stage-level latency samples for the bus dispatch and SSE emission path via
+  `core.metrics.observe_alarm_path_stage_latency_ms(...)`, which are surfaced in the
+  `/metrics` endpoint as `alarm_bus_dispatch_latency_ms_p95` and
+  `sse_delivery_latency_ms_p95` so load-test regressions can be attributed to the right layer.
 
 ### `processing.alarm_bus.AlarmBus.subscribe(room_id)`
 

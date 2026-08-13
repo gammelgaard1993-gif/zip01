@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 import config
 from api.dependencies import get_alarm_bus, get_db_connection
+from core.metrics import observe_alarm_path_stage_latency_ms
 
 _SSE_COMMENT = b": keep-alive\n\n"
 from models import AlarmEvent
@@ -209,18 +210,19 @@ async def alarms_stream(
                     )
                     rows = cursor.fetchall()
                     for row_id, device_id, row_room_id, ts, confidence, received_at in rows:
-                        logger.info(
-                            json.dumps(
-                                {
-                                    "event": "sse_alarm_replayed",
-                                    "room_id": room_id,
-                                    "device_id": device_id,
-                                    "ts": ts,
-                                    "received_at": received_at,
-                                    "fall_warning_id": row_id,
-                                }
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                json.dumps(
+                                    {
+                                        "event": "sse_alarm_replayed",
+                                        "room_id": room_id,
+                                        "device_id": device_id,
+                                        "ts": ts,
+                                        "received_at": received_at,
+                                        "fall_warning_id": row_id,
+                                    }
+                                )
                             )
-                        )
                         yield _persisted_sse_payload(
                             device_id, row_room_id, ts, confidence, received_at
                         )
@@ -245,22 +247,28 @@ async def alarms_stream(
                     and alarm.ts.isoformat() >= since_iso
                 ):
                     continue
-                # Feed latency is observed centrally in AlarmBus._dispatch_room (at dispatch time),
-                # so it is measured even when no SSE client is connected. Sampling here as well
-                # would double-count, so the stream only delivers frames.
-                logger.info(
-                    json.dumps(
-                        {
-                            "event": "sse_alarm_emitted",
-                            "room_id": room_id,
-                            "device_id": alarm.device_id,
-                            "ts": alarm.ts.isoformat(),
-                            "received_at": alarm.received_at.isoformat(),
-                            "fall_warning_id": alarm.fall_warning_id,
-                            "queue_age_ms": int((datetime.now(timezone.utc) - alarm.received_at).total_seconds() * 1000),
-                        }
-                    )
+                # Record the SSE delivery stage separately so we can compare it against the
+                # upstream bus dispatch latency and identify whether the remaining tail is in
+                # the queue drain or the actual response write.
+                emit_started_at = datetime.now(timezone.utc)
+                observe_alarm_path_stage_latency_ms(
+                    "sse_delivery",
+                    (emit_started_at - alarm.received_at).total_seconds() * 1000.0,
                 )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        json.dumps(
+                            {
+                                "event": "sse_alarm_emitted",
+                                "room_id": room_id,
+                                "device_id": alarm.device_id,
+                                "ts": alarm.ts.isoformat(),
+                                "received_at": alarm.received_at.isoformat(),
+                                "fall_warning_id": alarm.fall_warning_id,
+                                "queue_age_ms": int((datetime.now(timezone.utc) - alarm.received_at).total_seconds() * 1000),
+                            }
+                        )
+                    )
                 yield _sse_payload(alarm)
                 if is_subscriber_disconnected(queue):
                     # Evicted for being saturated: no further alarms will arrive on this queue.

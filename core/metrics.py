@@ -12,6 +12,9 @@ _MAX_LATENCY_SAMPLES = 5000
 # maxlen makes each append O(1) and evicts the oldest sample automatically.
 # Populated from the alarm hot path (AlarmBus._dispatch_room).
 _alarm_feed_latencies_ms: Deque[float] = deque(maxlen=_MAX_LATENCY_SAMPLES)
+_alarm_path_stage_latencies_ms: Dict[str, Deque[float]] = defaultdict(
+    lambda: deque(maxlen=_MAX_LATENCY_SAMPLES)
+)
 
 
 def increment_counter(name: str, amount: int = 1) -> None:
@@ -28,6 +31,23 @@ def observe_alarm_feed_latency_ms(value_ms: float) -> None:
     bounded_value = max(0.0, value_ms)
     with _latency_lock:
         _alarm_feed_latencies_ms.append(bounded_value)
+
+
+def observe_alarm_path_stage_latency_ms(stage: str, value_ms: float) -> None:
+    bounded_value = max(0.0, value_ms)
+    with _latency_lock:
+        _alarm_path_stage_latencies_ms[stage].append(bounded_value)
+
+
+def get_alarm_path_stage_latency_ms_p95(stage: str) -> int:
+    with _latency_lock:
+        samples = _alarm_path_stage_latencies_ms.get(stage)
+        if not samples:
+            return 0
+        sorted_values = sorted(samples)
+
+    rank_index = max(0, ceil(0.95 * len(sorted_values)) - 1)
+    return int(round(sorted_values[rank_index]))
 
 
 def get_alarm_feed_latency_ms_p95() -> int:

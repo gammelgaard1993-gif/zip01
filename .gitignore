@@ -40,4 +40,5 @@ Thumbs.db
 
 # Local benchmarking
 _bench.py
+helpers/
 

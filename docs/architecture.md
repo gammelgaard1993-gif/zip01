@@ -106,13 +106,13 @@ Shutdown sequence:
 
 - `processing.worker_pool.WorkerPool`
   - Routes each event to a worker by consistent hash of `device_id`
-    (`sha256(device_id)` first byte mod `WORKER_COUNT`, default 8), so all of a device's
+    (`sha256(device_id)` first byte mod `WORKER_COUNT`, default 24), so all of a device's
     events land on one worker.
   - Each worker owns a bounded two-lane priority queue (`WORKER_NORMAL_QUEUE_MAX_SIZE`): HIGH
     (`fall_warn`) is drained before NORMAL, so downstream routing preserves priority and cannot
     grow an unbounded FIFO; a full worker NORMAL lane backpressures the router (and thus ingress).
   - Keeps a per-device reorder buffer that sorts by `ts` before applying handlers.
-  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 100ms).
+  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 10ms).
   - Ordering guarantee is bounded to that window: an event arriving after its device's buffer
     already flushed is applied out of `ts` order relative to already-handled events (never
     dropped). Correctness of derived state is preserved by ts-aware, idempotent handlers rather
@@ -139,7 +139,7 @@ Shutdown sequence:
 
 - `processing.alarm_bus.AlarmBus`
   - Per-room subscribers with async queues.
-  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 100ms).
+  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 10ms).
   - `subscribe(room_id)` registers the new queue and, under the same lock, replays any alarms
     already held in `_room_buffers[room_id]` into it, so a subscriber arriving after `publish()`
     but before the `_dispatch_room` snapshot does not miss in-flight alarms.
