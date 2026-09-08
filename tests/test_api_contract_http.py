@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from api.routes.alarms import router as alarms_router
 from api.routes.events import router as events_router
 from api.routes.health import router as health_router
+from api.routes.metrics import router as metrics_router
 from api.routes.occupancy import router as occupancy_router
 from core.recovery import RecoveryManager
 from ingestion.queue import PriorityEventQueue
@@ -59,6 +60,22 @@ class _NullAlarmBus:
         return None
 
 
+class _WriterMetrics:
+    def metrics_snapshot(self) -> dict[str, int]:
+        return {
+            "sqlite_writer_queue_depth_normal": 3,
+            "sqlite_writer_commit_ms_p95": 7,
+        }
+
+
+class _WorkerMetrics:
+    def metrics_snapshot(self) -> dict[str, int]:
+        return {
+            "worker_queue_depth_normal": 4,
+            "worker_queue_depth_normal_max": 3,
+        }
+
+
 def _build_test_app(
     db_connection: sqlite3.Connection,
     redis_client: FakeRedis,
@@ -66,6 +83,7 @@ def _build_test_app(
 ) -> FastAPI:
     app = FastAPI()
     app.include_router(health_router)
+    app.include_router(metrics_router)
     app.include_router(occupancy_router)
     app.include_router(alarms_router)
     app.include_router(events_router)
@@ -104,6 +122,22 @@ class ApiContractHttpTests(unittest.TestCase):
             response = cast(ResponseLike, client_any.post("/events", json=payload))
         self.assertEqual(response.status_code, 202)
         self.assertEqual(cast(dict[str, object], response.json()), {"status": "accepted"})
+
+    def test_metrics_endpoint_merges_writer_diagnostics_into_counters(self) -> None:
+        self.app.state.sqlite_writer = _WriterMetrics()
+        self.app.state.worker_pool = _WorkerMetrics()
+
+        with TestClient(self.app) as client:
+            client_any = cast(Any, client)
+            response = cast(ResponseLike, client_any.get("/metrics"))
+
+        self.assertEqual(response.status_code, 200)
+        body = cast(dict[str, object], response.json())
+        counters = cast(dict[str, int], body["counters"])
+        self.assertEqual(counters["sqlite_writer_queue_depth_normal"], 3)
+        self.assertEqual(counters["sqlite_writer_commit_ms_p95"], 7)
+        self.assertEqual(counters["worker_queue_depth_normal"], 4)
+        self.assertEqual(counters["worker_queue_depth_normal_max"], 3)
 
     def test_alarms_endpoint_returns_challenge_shape(self) -> None:
         ts = datetime.now(timezone.utc).isoformat()

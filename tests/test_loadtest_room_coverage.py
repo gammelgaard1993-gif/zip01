@@ -1,6 +1,6 @@
 import unittest
 
-from _loadtest import build_rooms_to_watch, summarize_metrics
+from _loadtest import build_pressure_graph, build_rooms_to_watch, summarize_metrics
 
 
 class LoadTestRoomCoverageTests(unittest.TestCase):
@@ -34,6 +34,26 @@ class LoadTestMetricsTests(unittest.TestCase):
         self.assertEqual(summary["delta_events_ingested_total"], 20)
         self.assertEqual(summary["max_queue_depth_normal"], 8)
         self.assertEqual(summary["final_queue_depth_normal"], 0)
+
+    def test_pressure_graph_marks_normal_and_priority_peaks(self) -> None:
+        graph = build_pressure_graph(
+            [
+                {"elapsed_seconds": 0.0, "phase": "baseline", "counters": {}},
+                {
+                    "elapsed_seconds": 1.0,
+                    "phase": "burst",
+                    "counters": {
+                        "queue_depth_normal": 4,
+                        "sqlite_writer_queue_depth_priority": 2,
+                        "worker_queue_depth_normal": 1,
+                    },
+                },
+            ]
+        )
+
+        self.assertIn("    Ingress  .+  peak=4", graph)
+        self.assertIn("    Writer   .#  peak=2", graph)
+        self.assertIn("    Workers  .+  peak=1", graph)
 
 if __name__ == "__main__":
     unittest.main()

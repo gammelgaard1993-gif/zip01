@@ -105,6 +105,21 @@ class Phase3ProcessingTests(unittest.IsolatedAsyncioTestCase):
         first = await lane.get()
         self.assertEqual(first.priority, Priority.HIGH)
 
+    async def test_metrics_snapshot_reports_worker_backlog_and_inflight_age(self) -> None:
+        pool = WorkerPool(PriorityEventQueue(10), AlarmBus(), self.db, cast(Any, FakeRedis()))
+        event = self._event("motion")
+        worker_index = cast(Any, pool)._worker_index(event.device_id)
+        await pool.worker_queues[worker_index].put(event)
+        pool.mark_inflight(event.received_at.isoformat())
+
+        metrics = pool.metrics_snapshot()
+
+        self.assertEqual(metrics["worker_queue_depth_normal"], 1)
+        self.assertEqual(metrics["worker_queue_depth_normal_max"], 1)
+        self.assertEqual(metrics[f"worker_{worker_index}_queue_depth_normal"], 1)
+        self.assertEqual(metrics["worker_queue_depth_high"], 0)
+        self.assertGreaterEqual(metrics["worker_oldest_inflight_age_ms"], 0)
+
     async def test_stop_drains_buffered_events_before_shutdown(self) -> None:
         applied: list[str] = []
 

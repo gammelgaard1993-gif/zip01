@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 from concurrent.futures import Executor
+from datetime import datetime, timezone
 from sqlite3 import Connection
 from typing import TYPE_CHECKING, Dict, List
 
@@ -67,9 +68,17 @@ class WorkerPool:
         # so an event still queued/buffered during a snapshot capture is never excluded from
         # recovery replay.
         self._inflight_received_at: dict[str, int] = {}
+        self._oldest_inflight_received_at: str | None = None
+        self._worker_active_device_buffers = [0] * WORKER_COUNT
+        self._worker_pending_flushes = [0] * WORKER_COUNT
+        self._events_routed_total = 0
+        self._events_handled_total = 0
+        self._handler_failures_total = 0
 
     def mark_inflight(self, received_at_iso: str) -> None:
         self._inflight_received_at[received_at_iso] = self._inflight_received_at.get(received_at_iso, 0) + 1
+        if self._oldest_inflight_received_at is None or received_at_iso < self._oldest_inflight_received_at:
+            self._oldest_inflight_received_at = received_at_iso
 
     def unmark_inflight(self, received_at_iso: str) -> None:
         count = self._inflight_received_at.get(received_at_iso)
@@ -77,14 +86,44 @@ class WorkerPool:
             return
         if count <= 1:
             self._inflight_received_at.pop(received_at_iso, None)
+            if received_at_iso == self._oldest_inflight_received_at:
+                self._oldest_inflight_received_at = min(self._inflight_received_at, default=None)
         else:
             self._inflight_received_at[received_at_iso] = count - 1
 
     def oldest_inflight_received_at(self) -> str | None:
-        # UTC isoformat strings sort lexically in chronological order, so min() is the oldest.
-        if not self._inflight_received_at:
-            return None
-        return min(self._inflight_received_at)
+        # UTC isoformat strings sort lexically in chronological order. The cached minimum avoids
+        # scanning all accepted-but-unhandled events on every diagnostics scrape.
+        return self._oldest_inflight_received_at
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Return bounded aggregate processing metrics for the diagnostics endpoint."""
+        high_depths = [queue.qsize_high() for queue in self.worker_queues]
+        normal_depths = [queue.qsize_normal() for queue in self.worker_queues]
+        oldest_received_at = self.oldest_inflight_received_at()
+        oldest_age_ms = 0
+        if oldest_received_at is not None:
+            try:
+                received_at = datetime.fromisoformat(oldest_received_at).astimezone(timezone.utc)
+                oldest_age_ms = max(0, int((datetime.now(timezone.utc) - received_at).total_seconds() * 1000))
+            except ValueError:
+                oldest_age_ms = 0
+        metrics = {
+            "worker_queue_depth_high": sum(high_depths),
+            "worker_queue_depth_normal": sum(normal_depths),
+            "worker_queue_depth_high_max": max(high_depths, default=0),
+            "worker_queue_depth_normal_max": max(normal_depths, default=0),
+            "worker_active_device_buffers": sum(self._worker_active_device_buffers),
+            "worker_pending_flushes": sum(self._worker_pending_flushes),
+            "worker_events_routed_total": self._events_routed_total,
+            "worker_events_handled_total": self._events_handled_total,
+            "worker_handler_failures_total": self._handler_failures_total,
+            "worker_oldest_inflight_age_ms": oldest_age_ms,
+        }
+        for worker_index, (high_depth, normal_depth) in enumerate(zip(high_depths, normal_depths)):
+            metrics[f"worker_{worker_index}_queue_depth_high"] = high_depth
+            metrics[f"worker_{worker_index}_queue_depth_normal"] = normal_depth
+        return metrics
 
     async def start(self) -> None:
         self.workers = [asyncio.create_task(self._worker_loop(index, queue)) for index, queue in enumerate(self.worker_queues)]
@@ -124,14 +163,13 @@ class WorkerPool:
     async def _router_loop(self) -> None:
         # One of ROUTER_TASK_COUNT peer consumers of the shared priority queue, so one congested
         # worker queue can't head-of-line-block routing to the rest. Concurrent put()s into the
-        # same worker queue need no ordering coordination: per-device processing order is decided
-        # by each event's own ts field (re-sorted in the worker pool), not by put() arrival order
-        # -- the only exception is a tie-break among equal-ts events, which becomes nondeterministic
-        # across router tasks instead of FIFO; this is permitted since ts is the sole ordering key.
+        # same worker queue need no ordering coordination: the worker buffer orders each device by
+        # timestamp, optional source sequence, and durable admission ID, never router arrival order.
         while True:
             event = await self.event_queue.get()
             index = self._worker_index(event.device_id)
             await self.worker_queues[index].put(event)
+            self._events_routed_total += 1
 
     def _worker_index(self, device_id: str) -> int:
         # Consistent hash on device_id: every event for a device always lands on the same worker,
@@ -165,6 +203,7 @@ class WorkerPool:
             device_events = device_buffers.setdefault(event.device_id, [])
             device_events.append(event)
             device_events.sort(key=_device_order_key)
+            self._worker_active_device_buffers[index] = len(device_buffers)
 
             # Arm a single in-flight flush per device. A flush already scheduled will pick up this
             # event when it fires, so we only schedule a new one when none is pending.
@@ -182,6 +221,7 @@ class WorkerPool:
                 self.flush_tasks.add(task)
                 task.add_done_callback(self.flush_tasks.discard)
                 flush_tasks[event.device_id] = task
+                self._worker_pending_flushes[index] = len(flush_tasks)
 
     async def _flush_device_buffer(
         self,
@@ -208,9 +248,13 @@ class WorkerPool:
                 # to SQLite before the worker runs. The worker owns only the derived hot state, so
                 # a handler failure here is isolated and never risks the durable record.
                 handler = handlers.get(next_event.type, handlers["motion"])
+                handler_attempt_completed = False
                 try:
                     await handler.handle(next_event)
+                    handler_attempt_completed = True
                 except Exception:
+                    handler_attempt_completed = True
+                    self._handler_failures_total += 1
                     # Failure isolation: a single handler error is logged and skipped so it can't
                     # kill the worker or stall this device's buffer. The event is already durable
                     # (persisted at admission), so only recoverable hot state is affected.
@@ -224,10 +268,14 @@ class WorkerPool:
                         },
                     )
                 finally:
+                    if handler_attempt_completed:
+                        self._events_handled_total += 1
                     # Deregister from the in-flight watermark once processed (applied or failed);
                     # the durable record already exists, so this only relaxes the snapshot cutoff.
                     self.unmark_inflight(next_event.received_at.isoformat())
 
-            device_buffers.pop(device_id, None)
         finally:
             flush_tasks.pop(device_id, None)
+            device_buffers.pop(device_id, None)
+            self._worker_active_device_buffers[worker_index] = len(device_buffers)
+            self._worker_pending_flushes[worker_index] = len(flush_tasks)

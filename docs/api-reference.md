@@ -152,5 +152,31 @@ Returns a `counters` object with runtime metrics, including:
 - Admission/processing: `events_persist_failed`, `events_enqueue_failed`,
   `presence_watch_conflicts`
 - Backpressure: `queue_pressure`, `queue_depth_high`, `queue_depth_normal`
+- Worker processing: `worker_queue_depth_high`, `worker_queue_depth_normal`,
+  `worker_active_device_buffers`, `worker_pending_flushes`, `worker_oldest_inflight_age_ms`
+- Worker queue concentration: `worker_queue_depth_high_max`, `worker_queue_depth_normal_max`,
+  plus fixed per-worker current lane depths as `worker_<index>_queue_depth_high` and
+  `worker_<index>_queue_depth_normal`
+- Worker lifetime counters: `worker_events_routed_total`, `worker_events_handled_total`,
+  `worker_handler_failures_total`
 - Latency: `alarm_feed_latency_ms_p95`, `alarm_bus_dispatch_latency_ms_p95`,
   `sse_delivery_latency_ms_p95`
+- SQLite writer backlog: `sqlite_writer_queue_depth_normal`,
+  `sqlite_writer_queue_depth_priority`
+- SQLite writer latency (integer ms p95 of the most recent 5,000 successful batches):
+  `sqlite_writer_queue_wait_ms_p95`, `sqlite_writer_commit_ms_p95`
+- SQLite writer commit state: `sqlite_writer_batches_committed_total`,
+  `sqlite_writer_commit_failures_total`, `sqlite_writer_last_batch_size`
+
+Writer queue depths are current queued writes. Queue-wait p95 measures submission-to-batch-execution
+delay for committed jobs; commit p95 measures batch SQL execution plus `commit()`. A failed batch
+increments `sqlite_writer_commit_failures_total` once, while `sqlite_writer_last_batch_size` remains
+zero until the first successful batch.
+
+Worker queue depths are current sums across all worker-local HIGH or NORMAL lanes. Their `_max`
+counterparts and fixed per-worker fields are current values rather than historical peaks; compare
+them to the aggregate to detect device-hash skew. Active buffers and pending flushes count distinct
+device-level reorder work. `worker_events_handled_total` counts completed handler attempts,
+including isolated handler failures but excluding cancelled work. `worker_oldest_inflight_age_ms`
+is the age of the oldest admitted event not yet finished by a handler; that same watermark protects
+the recovery snapshot replay cutoff.
