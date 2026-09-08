@@ -40,6 +40,22 @@ The service connects to `localhost:6379` (Redis, required) by default and listen
 HTTP `POST /events` is the primary transport (what the reference generator
 [event_generator/generate.py](event_generator/generate.py) posts to).
 
+### Concurrent Load Test
+
+The pooled local helper uses reusable HTTP connections and samples `/metrics` independently of
+the request pool. Install development dependencies first, then run it against a running service:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python helpers/_loadtest.py --devices 500 --duration 120 --connections 32 --metrics-interval 1
+python helpers/_loadtest.py --devices 500 --duration 90 --connections 32 --metrics-interval 1 --burst
+```
+
+`--connections` caps reusable concurrent POST connections; `--concurrency` remains a legacy
+alias. The burst is fixed at $10\times$ from elapsed seconds 30 through 60, so use a duration
+greater than 60 seconds for a complete burst. The report includes request and sampled SSE latency,
+counter deltas, queue-depth peaks, and final queue depths.
+
 ## Testing
 
 The test suite is organized by behavior layer so the project-level structure stays readable:
@@ -56,8 +72,9 @@ Shared test doubles and helper conventions are documented in [docs/testing-struc
 Current local result: **113 tests run: 112 passed, 1 optional real-Redis concurrency test skipped** when
 `TEST_REDIS_URL` is not configured. The suite verifies cancellation-safe admission and queueing,
 atomic presence updates, deterministic recovery, and API contracts. Challenge-scale throughput
-and sustained p95 latency still require a dedicated concurrent load run; the supplied synchronous
-generator is useful for compatibility checks, not as proof of the 5k/s and 50k/s targets.
+and sustained p95 latency are not established by the test suite. Use
+[helpers/_loadtest.py](helpers/_loadtest.py) for a local concurrent measurement; the supplied
+synchronous generator is useful for compatibility checks, not as proof of the 5k/s and 50k/s targets.
 
 ## AI Collaboration Template (v1)
 

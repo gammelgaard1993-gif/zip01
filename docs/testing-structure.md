@@ -42,3 +42,7 @@ This repository uses a layered test model so the behavior of the streaming backe
 - Manual or scheduled: long-running load and resilience checks. The local correctness baseline is
   **113 run: 112 passed, 1 optional real-Redis test skipped** without `TEST_REDIS_URL`; it does not by
   itself prove challenge-scale 5k/s baseline, 50k/s burst, or sustained p95 latency.
+- `helpers/_loadtest.py` is the manual concurrent load runner. It reports request throughput and
+  errors, POST and sampled fall-warning-to-SSE latency, plus sampled server counter deltas and
+  queue/latency peaks. It is a local measurement tool, not independent proof of challenge-scale
+  capacity.

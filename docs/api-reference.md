@@ -152,4 +152,5 @@ Returns a `counters` object with runtime metrics, including:
 - Admission/processing: `events_persist_failed`, `events_enqueue_failed`,
   `presence_watch_conflicts`
 - Backpressure: `queue_pressure`, `queue_depth_high`, `queue_depth_normal`
-- Latency: `alarm_feed_latency_ms_p95`
+- Latency: `alarm_feed_latency_ms_p95`, `alarm_bus_dispatch_latency_ms_p95`,
+  `sse_delivery_latency_ms_p95`
