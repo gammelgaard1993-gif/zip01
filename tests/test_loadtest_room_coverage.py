@@ -1,6 +1,6 @@
 import unittest
 
-from _loadtest import build_pressure_graph, build_rooms_to_watch, summarize_metrics
+from _loadtest import Stats, build_pressure_graph, build_rooms_to_watch, summarize_metrics
 
 
 class LoadTestRoomCoverageTests(unittest.TestCase):
@@ -54,6 +54,15 @@ class LoadTestMetricsTests(unittest.TestCase):
         self.assertIn("    Ingress  .+  peak=4", graph)
         self.assertIn("    Writer   .#  peak=2", graph)
         self.assertIn("    Workers  .+  peak=1", graph)
+
+    def test_stats_tracks_planned_dispatches_and_non_negative_schedule_lag(self) -> None:
+        stats = Stats()
+        stats.record_dispatch(-5.0)
+        stats.record_dispatch(12.5)
+
+        self.assertEqual(stats.planned, 2)
+        self.assertEqual(stats.dispatched, 2)
+        self.assertEqual(stats.schedule_lag_ms, [0.0, 12.5])
 
 if __name__ == "__main__":
     unittest.main()
