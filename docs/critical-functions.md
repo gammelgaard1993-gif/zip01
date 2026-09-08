@@ -36,7 +36,8 @@ Side effects:
 Failure behavior:
 
 - Raises `ValidationError` for schema issues, invalid timestamp parse, or clock skew beyond
-  +/-1 hour. `seq` is diagnostics-only and is not used for ordering.
+  +/-1 hour. When supplied, `seq` is persisted and is the secondary per-device ordering key for
+  equal timestamps; the durable event ID is the final fallback.
 
 ### `api.routes.events.ingest_event(request, response)` (primary transport)
 
@@ -127,7 +128,7 @@ Purpose:
 Behavior:
 
 1. Wait reorder buffer duration.
-2. Sort buffered events by timestamp.
+2. Sort buffered events by timestamp, optional sequence, then durable event ID.
 3. Invoke resolved handler for each event in `ts` order.
 
 Failure behavior:

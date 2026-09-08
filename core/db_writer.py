@@ -4,7 +4,9 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from math import ceil
 from typing import Any
 
 import asyncio
@@ -34,6 +36,7 @@ class _WriteJob:
     priority: bool = False
     rowcount: int = field(default=0, init=False)
     lastrowid: int | None = field(default=None, init=False)
+    submitted_at: float = field(default_factory=time.monotonic)
 
 
 _STOP = object()
@@ -89,6 +92,12 @@ class BatchedSQLiteWriter:
         # sentinel value competing for queue capacity can be rejected by queue.Full under a large
         # backlog, leaving the thread with nothing telling it to exit.
         self._stop_event = threading.Event()
+        self._metrics_lock = threading.Lock()
+        self._queue_wait_ms: deque[float] = deque(maxlen=5000)
+        self._commit_ms: deque[float] = deque(maxlen=5000)
+        self._batches_committed_total = 0
+        self._commit_failures_total = 0
+        self._last_batch_size = 0
 
     def start(self) -> None:
         with self._lock:
@@ -138,6 +147,19 @@ class BatchedSQLiteWriter:
             except queue.Full:
                 future.set_exception(SQLiteWriterError("sqlite writer queue is full"))
         return future
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Return bounded writer backlog and latency metrics for the diagnostics endpoint."""
+        with self._metrics_lock:
+            return {
+                "sqlite_writer_queue_depth_normal": self._normal_queue.qsize(),
+                "sqlite_writer_queue_depth_priority": self._priority_queue.qsize(),
+                "sqlite_writer_queue_wait_ms_p95": _p95(self._queue_wait_ms),
+                "sqlite_writer_commit_ms_p95": _p95(self._commit_ms),
+                "sqlite_writer_batches_committed_total": self._batches_committed_total,
+                "sqlite_writer_commit_failures_total": self._commit_failures_total,
+                "sqlite_writer_last_batch_size": self._last_batch_size,
+            }
 
     def _run(self) -> None:
         connection = get_db_connection(self._path)
@@ -255,6 +277,7 @@ class BatchedSQLiteWriter:
 
     def _flush(self, connection: Any, jobs: list[_WriteJob]) -> None:
         cursor = connection.cursor()
+        started_at = time.monotonic()
         try:
             for job in jobs:
                 cursor.execute(job.sql, job.params)
@@ -263,9 +286,17 @@ class BatchedSQLiteWriter:
             connection.commit()
         except Exception as exc:  # noqa: BLE001 -- must propagate to every waiter, not swallow
             connection.rollback()
+            with self._metrics_lock:
+                self._commit_failures_total += 1
             for job in jobs:
                 _safe_call_soon_threadsafe(job.loop, _fail_future, job.future, exc)
             return
+        completed_at = time.monotonic()
+        with self._metrics_lock:
+            self._commit_ms.append((completed_at - started_at) * 1000.0)
+            self._queue_wait_ms.extend((started_at - job.submitted_at) * 1000.0 for job in jobs)
+            self._batches_committed_total += 1
+            self._last_batch_size = len(jobs)
         for job in jobs:
             _safe_call_soon_threadsafe(job.loop, _resolve_future, job.future, (job.rowcount, job.lastrowid))
 
@@ -290,3 +321,11 @@ def _resolve_future(future: "asyncio.Future[tuple[int, int | None]]", result: tu
 def _fail_future(future: "asyncio.Future[tuple[int, int | None]]", exc: Exception) -> None:
     if not future.done():
         future.set_exception(exc)
+
+
+def _p95(samples: deque[float]) -> int:
+    if not samples:
+        return 0
+    values = sorted(samples)
+    rank_index = max(0, ceil(0.95 * len(values)) - 1)
+    return int(round(values[rank_index]))

@@ -28,6 +28,9 @@ async def metrics(request: Request) -> MetricsResponse:
         event_queue = cast(PriorityEventQueue, raw_event_queue)
         counters["queue_depth_high"] = event_queue.qsize_high()
         counters["queue_depth_normal"] = event_queue.qsize_normal()
+    sqlite_writer = getattr(request.app.state, "sqlite_writer", None)
+    if sqlite_writer is not None:
+        counters.update(sqlite_writer.metrics_snapshot())
     counters["alarm_feed_latency_ms_p95"] = get_alarm_feed_latency_ms_p95()
     counters["alarm_bus_dispatch_latency_ms_p95"] = get_alarm_path_stage_latency_ms_p95(
         "alarm_bus_dispatch"

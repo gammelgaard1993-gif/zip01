@@ -7,7 +7,7 @@
 The runtime-critical path is the mechanism that satisfies the scoring targets. The key invariants are:
 
 - Persist-before-ack: accepted events are durably written to SQLite before the HTTP response completes, so recovery and no-silent-loss behavior are anchored in admission rather than in later processing.
-- Bounded per-device ordering: worker-side buffering reorders events for the same device by `ts` within a short window, preserving correctness for slightly late arrivals without turning the system into an unbounded buffer.
+- Bounded per-device ordering: worker-side buffering orders events for the same device by `ts`, optional `seq`, then durable event ID within a short window, preserving deterministic correctness for slightly late arrivals without turning the system into an unbounded buffer.
 - Staged alarm delivery: alarm latency is measured across the full path from ingestion to SSE fan-out, not only through handler execution.
 - Recovery on ingestion order: replay uses the ingestion-order cutoff (`received_at`) so late events are recovered correctly even when their device `ts` predates a snapshot.
 - Delay-based backpressure: burst traffic slows `POST /events` rather than dropping valid events, and `fall_warn` traffic is kept isolated from normal traffic.
@@ -64,8 +64,8 @@ These invariants connect the scoring targets to the main requirements: correctne
 - Each worker owns a bounded two-lane priority queue (HIGH drained before NORMAL), so a HIGH
   `fall_warn` never waits behind a NORMAL backlog already routed to that worker, and the lane
   cannot grow unbounded (a full NORMAL lane backpressures the router).
-- Worker stores events in a per-device buffer and sorts by event `ts`.
-- Flush task waits the reorder window (`DEVICE_REORDER_BUFFER_MS`, 10ms), then processes oldest first.
+- Worker stores events in a per-device buffer and sorts by `ts`, optional `seq`, then durable event ID.
+- Flush task waits the reorder window (`DEVICE_REORDER_BUFFER_MS`, 5ms), then processes oldest first.
 - **Ordering contract is bounded, not unconditional**: strict `ts` apply-order only holds for
   events that arrive within the same `DEVICE_REORDER_BUFFER_MS` window. An event arriving after
   its device's buffer already flushed (arbitrarily late, e.g. an offline device catching up) is
@@ -130,7 +130,7 @@ For each flushed event:
 1. `fall_warn` accepted by handler.
 2. Alarm persisted to SQLite.
 3. Alarm published to in-memory room buffer in alarm bus.
-4. Alarm bus dispatches after reorder delay (`ALARM_REORDER_BUFFER_MS`, 10ms) to each
+4. Alarm bus dispatches after reorder delay (`ALARM_REORDER_BUFFER_MS`, 5ms) to each
    subscriber queue (bounded, `SSE_SUBSCRIBER_QUEUE_MAX_SIZE`). A subscriber whose queue is full
    (stalled/slow client) is evicted (`sse_subscribers_evicted`) instead of blocking dispatch to
    the room's other subscribers; once drained, that client's stream closes and it must reconnect
@@ -165,7 +165,7 @@ For each flushed event:
 3. Snapshot data is reapplied to Redis.
   Snapshots containing legacy presence state without tie-break metadata are rejected instead,
   including their cutoff, and recovery starts from the full durable log.
-4. Events are replayed from SQLite in timestamp order.
+4. Events are replayed from SQLite in deterministic `(ts, id)` order; persisted optional `seq` is restored for handler processing.
 5. Replay cutoff is on `received_at` (ingestion order), inclusive of the snapshot timestamp, so
    late events ingested after the snapshot are not dropped.
 6. Timestamp-aware handlers prevent stale overwrite; deterministic presence ties make replay

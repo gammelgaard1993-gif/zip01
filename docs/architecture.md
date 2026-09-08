@@ -19,7 +19,7 @@ zip01 is a layered backend for high-volume sensor events.
 The runtime-critical path should be read as a sequence of invariants rather than as a set of loosely related modules. These invariants are the bridge between the scoring targets in the challenge contract and the main functional and non-functional requirements:
 
 1. Persist-before-ack: every accepted event is durably recorded in SQLite before the HTTP response is finalized. This is the basis for restart/recovery correctness and for the no-silent-loss expectation under burst load.
-2. Bounded per-device ordering: events for the same device are processed in `ts` order within the worker reorder window. This preserves correctness for late arrivals without requiring unbounded buffering.
+2. Bounded per-device ordering: events for the same device are processed by `ts`, optional `seq`, then durable event ID within the worker reorder window. This preserves deterministic correctness for late arrivals without requiring unbounded buffering.
 3. Staged alarm delivery: alarm publication spans durable persistence, worker buffering, room-level buffering, and SSE fan-out. The 1-second p95 alarm target applies to the full path, not only handler completion.
 4. Recovery on ingestion order: replay uses the ingestion-order cutoff (`received_at`) so late events ingested after a snapshot are replayed correctly even when their device `ts` predates the snapshot.
 5. Delay-based backpressure: burst traffic may slow `POST /events`, but the system must not silently drop valid events; high-priority `fall_warn` traffic is isolated from normal traffic and only backpressures when its own lane saturates.
@@ -31,9 +31,9 @@ Taken together, these invariants explain why the challenge is scored on the full
 ```text
 POST /events
   └─ validate ──> persist to SQLite ──> enqueue (HIGH/NORMAL)
-       └─ worker router (device-hash) ──> per-device reorder buffer (100ms)
+      └─ worker router (device-hash) ──> per-device reorder buffer (5ms)
             └─ handlers (Redis hot state + alarm publication)
-                 └─ per-room alarm buffer (100ms) ──> SSE subscribers / replay
+                 └─ per-room alarm buffer (5ms) ──> SSE subscribers / replay
 ```
 
 ## Runtime Composition
@@ -111,8 +111,8 @@ Shutdown sequence:
   - Each worker owns a bounded two-lane priority queue (`WORKER_NORMAL_QUEUE_MAX_SIZE`): HIGH
     (`fall_warn`) is drained before NORMAL, so downstream routing preserves priority and cannot
     grow an unbounded FIFO; a full worker NORMAL lane backpressures the router (and thus ingress).
-  - Keeps a per-device reorder buffer that sorts by `ts` before applying handlers.
-  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 10ms).
+  - Keeps a per-device reorder buffer that sorts by `ts`, optional `seq`, then durable event ID before applying handlers.
+  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 5ms).
   - Ordering guarantee is bounded to that window: an event arriving after its device's buffer
     already flushed is applied out of `ts` order relative to already-handled events (never
     dropped). Correctness of derived state is preserved by ts-aware, idempotent handlers rather
@@ -139,7 +139,7 @@ Shutdown sequence:
 
 - `processing.alarm_bus.AlarmBus`
   - Per-room subscribers with async queues.
-  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 10ms).
+  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 5ms).
   - `subscribe(room_id)` registers the new queue and, under the same lock, replays any alarms
     already held in `_room_buffers[room_id]` into it, so a subscriber arriving after `publish()`
     but before the `_dispatch_room` snapshot does not miss in-flight alarms.
@@ -166,7 +166,7 @@ Routes in `api/routes/*`:
   - Rejects legacy presence snapshots without tie-break metadata and discards their cutoff, then
     performs a full durable-log replay so equal-timestamp state remains deterministic.
   - Clears managed Redis keys and reapplies snapshot.
-  - Replays events from SQLite `events` ordered by `ts ASC`.
+  - Replays events from SQLite `events` ordered by `ts ASC, id ASC`.
   - Uses inclusive replay boundary on ingestion order (`received_at >= snapshot_ts`), so late
     events ingested after the snapshot are replayed instead of dropped.
   - Runs periodic snapshot loop.

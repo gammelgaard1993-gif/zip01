@@ -24,6 +24,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _device_order_key(event: ValidatedEvent) -> tuple[object, ...]:
+    """Return the bounded-window order key shared by all live worker buffers."""
+    return (
+        event.ts,
+        event.seq is None,
+        event.seq if event.seq is not None else 0,
+        event.durable_event_id if event.durable_event_id is not None else 2**63 - 1,
+    )
+
+
 class WorkerPool:
     def __init__(
         self,
@@ -154,7 +164,7 @@ class WorkerPool:
             # the reorder window is handled in timestamp order rather than arrival order.
             device_events = device_buffers.setdefault(event.device_id, [])
             device_events.append(event)
-            device_events.sort(key=lambda item: item.ts)
+            device_events.sort(key=_device_order_key)
 
             # Arm a single in-flight flush per device. A flush already scheduled will pick up this
             # event when it fires, so we only schedule a new one when none is pending.
@@ -192,7 +202,7 @@ class WorkerPool:
 
             while device_events:
                 # Re-sort on each iteration: an event may have been appended during the await above.
-                device_events.sort(key=lambda item: item.ts)
+                device_events.sort(key=_device_order_key)
                 next_event = device_events.pop(0)
                 # Durability already happened at admission: the /events route persists the event
                 # to SQLite before the worker runs. The worker owns only the derived hot state, so

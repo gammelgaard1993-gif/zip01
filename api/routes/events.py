@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from typing import Any, cast
 
 from fastapi import APIRouter, Request, Response
@@ -143,12 +144,13 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
         persisted = False
         try:
             if sqlite_writer is not None:
-                await persist_validated_event_async(sqlite_writer, validated)
+                durable_event_id = await persist_validated_event_async(sqlite_writer, validated)
             else:
-                persist_validated_event(db_connection, validated)
+                durable_event_id = persist_validated_event(db_connection, validated)
             persisted = True
+            queued_event = replace(validated, durable_event_id=durable_event_id)
 
-            if validated.priority == Priority.NORMAL and event_queue.normal_is_full():
+            if queued_event.priority == Priority.NORMAL and event_queue.normal_is_full():
                 increment_counter("queue_pressure")
                 logger.warning(
                     json.dumps(
@@ -159,7 +161,7 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
                         }
                     )
                 )
-            await event_queue.put(validated)
+            await event_queue.put(queued_event)
         except (sqlite3.Error, SQLiteWriterError) as exc:
             increment_counter("events_persist_failed")
             logger.error(

@@ -32,6 +32,7 @@ class ValidatedEvent:
     priority: Priority
     received_at: datetime
     seq: int | None = None
+    durable_event_id: int | None = None
 
 
 @dataclass(frozen=True)

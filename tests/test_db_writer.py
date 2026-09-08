@@ -104,6 +104,13 @@ class BatchedSQLiteWriterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reader.close()
 
+        metrics = self.writer.metrics_snapshot()
+        self.assertEqual(metrics["sqlite_writer_queue_depth_normal"], 0)
+        self.assertEqual(metrics["sqlite_writer_batches_committed_total"], 1)
+        self.assertEqual(metrics["sqlite_writer_last_batch_size"], 20)
+        self.assertGreaterEqual(metrics["sqlite_writer_queue_wait_ms_p95"], 0)
+        self.assertGreaterEqual(metrics["sqlite_writer_commit_ms_p95"], 0)
+
     async def test_sql_error_fails_future_without_crashing_writer_thread(self) -> None:
         with self.assertRaises(Exception):
             await self.writer.submit("INSERT INTO not_a_real_table (x) VALUES (?)", (1,))

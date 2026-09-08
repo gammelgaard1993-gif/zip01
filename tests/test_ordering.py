@@ -88,6 +88,65 @@ class WorkerOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(applied_ts), 2)
         self.assertEqual(applied_ts, sorted(applied_ts))
 
+    async def test_same_timestamp_events_apply_in_durable_id_order(self) -> None:
+        applied_ids: list[int | None] = []
+
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            applied_ids.append(event.durable_event_id)
+
+        event_queue = PriorityEventQueue(normal_max_size=100)
+        pool = WorkerPool(
+            event_queue=event_queue,
+            alarm_bus=AlarmBus(),
+            db_connection=self.db,
+            redis_client=cast(Any, FakeRedis()),
+        )
+        timestamp = datetime.now(timezone.utc)
+        later_id = ValidatedEvent(
+            device_id="dev_1", room_id="room_1", type="motion", ts=timestamp, payload={},
+            late=False, priority=Priority.NORMAL, received_at=timestamp, durable_event_id=2,
+        )
+        earlier_id = ValidatedEvent(
+            device_id="dev_1", room_id="room_1", type="motion", ts=timestamp, payload={},
+            late=False, priority=Priority.NORMAL, received_at=timestamp, durable_event_id=1,
+        )
+
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await event_queue.put(later_id)
+            await event_queue.put(earlier_id)
+            await asyncio.sleep(0.6)
+            await pool.stop()
+
+        self.assertEqual(applied_ids, [1, 2])
+
+    async def test_same_timestamp_sequence_precedes_durable_id(self) -> None:
+        applied_sequences: list[int | None] = []
+
+        async def record(self: GenericEventHandler, event: ValidatedEvent) -> None:
+            applied_sequences.append(event.seq)
+
+        event_queue = PriorityEventQueue(normal_max_size=100)
+        pool = WorkerPool(event_queue, AlarmBus(), self.db, cast(Any, FakeRedis()))
+        timestamp = datetime.now(timezone.utc)
+        higher_sequence = ValidatedEvent(
+            "dev_1", "room_1", "motion", timestamp, {}, False, Priority.NORMAL,
+            timestamp, seq=2, durable_event_id=1,
+        )
+        lower_sequence = ValidatedEvent(
+            "dev_1", "room_1", "motion", timestamp, {}, False, Priority.NORMAL,
+            timestamp, seq=1, durable_event_id=2,
+        )
+
+        with patch.object(GenericEventHandler, "handle", new=record):
+            await pool.start()
+            await event_queue.put(higher_sequence)
+            await event_queue.put(lower_sequence)
+            await asyncio.sleep(0.6)
+            await pool.stop()
+
+        self.assertEqual(applied_sequences, [1, 2])
+
     def _heartbeat(self, device_id: str, ts: datetime) -> ValidatedEvent:
         return ValidatedEvent(
             device_id=device_id,

@@ -28,6 +28,10 @@ This repository uses a layered test model so the behavior of the streaming backe
   and recovery tests.
 - Add new helpers there when the same fake or protocol would otherwise be duplicated across files.
 
+`tests/test_ordering.py` covers the bounded 5ms per-device reorder window, timestamp ordering,
+sequence and durable-ID tie-breaking for equal timestamps, and timestamp-aware correctness when
+an event arrives after its prior buffer has flushed.
+
 ## Adding New Tests
 
 - Choose the lowest layer that can prove the behavior.

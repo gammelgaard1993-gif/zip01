@@ -414,7 +414,8 @@ class RecoveryManager:
         cursor = self.db_connection.cursor()
         if since_ts is None:
             cursor.execute(
-                "SELECT device_id, room_id, type, ts, payload, received_at, late FROM events ORDER BY ts ASC"
+                "SELECT id, device_id, room_id, type, ts, payload, received_at, late "
+                "FROM events ORDER BY ts ASC, id ASC"
             )
         else:
             # Cut off on received_at (ingestion order), NOT ts (device clock). A snapshot is
@@ -428,7 +429,8 @@ class RecoveryManager:
             # timestamp-aware and idempotent, so re-applying a captured event is safe. Rows are
             # still ordered by ts so per-device state is rebuilt in chronological order.
             cursor.execute(
-                "SELECT device_id, room_id, type, ts, payload, received_at, late FROM events WHERE received_at >= ? ORDER BY ts ASC",
+                "SELECT id, device_id, room_id, type, ts, payload, received_at, late "
+                "FROM events WHERE received_at >= ? ORDER BY ts ASC, id ASC",
                 (since_ts,),
             )
         # fall_warn is the only handler with side effects beyond hot state (DB insert + alarm
@@ -444,7 +446,7 @@ class RecoveryManager:
         }
 
         replayed = 0
-        for device_id, room_id, event_type, ts_text, payload_text, received_at_text, late_flag in cursor.fetchall():
+        for durable_event_id, device_id, room_id, event_type, ts_text, payload_text, received_at_text, late_flag in cursor.fetchall():
             try:
                 ts = datetime.fromisoformat(_as_text(cast(str | bytes | bytearray | memoryview, ts_text))).astimezone(
                     timezone.utc
@@ -453,6 +455,9 @@ class RecoveryManager:
                 if not isinstance(raw_payload, dict):
                     raise ValidationError("replayed payload must be a JSON object", reason="invalid_schema")
                 payload = cast(dict[str, Any], raw_payload)
+                seq = payload.pop("seq", None)
+                if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
+                    raise ValidationError("replayed seq must be an integer", reason="invalid_schema")
                 received_at = datetime.fromisoformat(
                     _as_text(cast(str | bytes | bytearray | memoryview, received_at_text))
                 )
@@ -467,6 +472,8 @@ class RecoveryManager:
                     late=bool(late_flag),
                     priority=priority,
                     received_at=received_at,
+                    seq=seq,
+                    durable_event_id=durable_event_id,
                 )
                 handler = handlers.get(event_type, handlers["motion"])
                 await handler.handle(event)
