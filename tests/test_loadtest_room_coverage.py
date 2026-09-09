@@ -1,6 +1,6 @@
 import unittest
 
-from _loadtest import Stats, build_pressure_graph, build_rooms_to_watch, summarize_metrics
+from _loadtest import Stats, build_dashboard_html, build_pressure_graph, build_rooms_to_watch, summarize_metrics
 
 
 class LoadTestRoomCoverageTests(unittest.TestCase):
@@ -35,6 +35,18 @@ class LoadTestMetricsTests(unittest.TestCase):
         self.assertEqual(summary["max_queue_depth_normal"], 8)
         self.assertEqual(summary["final_queue_depth_normal"], 0)
 
+    def test_summarize_metrics_reports_worker_activity_as_gauges(self) -> None:
+        summary = summarize_metrics(
+            [
+                {"elapsed_seconds": 0.0, "phase": "baseline", "counters": {"worker_active_device_buffers": 3}},
+                {"elapsed_seconds": 1.0, "phase": "after", "counters": {"worker_active_device_buffers": 0}},
+            ]
+        )
+
+        self.assertEqual(summary["max_worker_active_device_buffers"], 3)
+        self.assertEqual(summary["final_worker_active_device_buffers"], 0)
+        self.assertNotIn("delta_worker_active_device_buffers", summary)
+
     def test_pressure_graph_marks_normal_and_priority_peaks(self) -> None:
         graph = build_pressure_graph(
             [
@@ -63,6 +75,26 @@ class LoadTestMetricsTests(unittest.TestCase):
         self.assertEqual(stats.planned, 2)
         self.assertEqual(stats.dispatched, 2)
         self.assertEqual(stats.schedule_lag_ms, [0.0, 12.5])
+
+    def test_dashboard_contains_pressure_panels_and_room_heatmap_data(self) -> None:
+        dashboard = build_dashboard_html(
+            [{"elapsed_seconds": 0.0, "phase": "baseline", "counters": {"queue_depth_normal": 2}}],
+            {"room_000": {0: 3}},
+        )
+
+        self.assertIn("Ingress Requests / Second", dashboard)
+        self.assertIn("SQLite Writer Batches / Second", dashboard)
+        self.assertIn("Worker Events / Second", dashboard)
+        self.assertIn("Room Traffic Profile", dashboard)
+        self.assertIn("Top 10 Busiest Rooms", dashboard)
+        self.assertIn("all rooms, sorted busiest to quietest", dashboard)
+        self.assertIn("const chartDefinitions", dashboard)
+        self.assertIn("'events_ingested_total'", dashboard)
+        self.assertIn('id="phase"', dashboard)
+        self.assertIn('id="focus"', dashboard)
+        self.assertIn("function updateSummary", dashboard)
+        self.assertIn("function roomDistribution", dashboard)
+        self.assertIn('"room_000": {"0": 3}', dashboard)
 
 if __name__ == "__main__":
     unittest.main()

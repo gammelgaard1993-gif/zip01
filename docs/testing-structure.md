@@ -47,6 +47,11 @@ an event arrives after its prior buffer has flushed.
   **113 run: 112 passed, 1 optional real-Redis test skipped** without `TEST_REDIS_URL`; it does not by
   itself prove challenge-scale 5k/s baseline, 50k/s burst, or sustained p95 latency.
 - `helpers/_loadtest.py` is the manual concurrent load runner. It reports request throughput and
-  errors, POST and sampled fall-warning-to-SSE latency, plus sampled server counter deltas and
-  queue/latency peaks. It is a local measurement tool, not independent proof of challenge-scale
-  capacity.
+  errors, POST and sampled fall-warning-to-SSE latency, and writes a self-contained HTML dashboard
+  to `loadtest-dashboard.html` by default (`--report <path>` overrides it). The dashboard filters
+  sampled charts by phase (all, baseline, burst, or after-drain) and pipeline stage (all, ingress,
+  SQLite writer, or workers), shows selected-sample ingress-rate, queue-depth, oldest-work-age,
+  and correctness-failure KPIs, and retains generated per-room traffic by second. Sampled metric
+  summaries use first-to-last deltas for counters and max/final values for
+  queue/activity/age/p95/last-batch gauges. It is a local measurement tool, not independent proof
+  of challenge-scale capacity.

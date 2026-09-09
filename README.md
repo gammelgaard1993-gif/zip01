@@ -52,9 +52,19 @@ python helpers/_loadtest.py --devices 500 --duration 90 --connections 32 --metri
 ```
 
 `--connections` caps reusable concurrent POST connections; `--concurrency` remains a legacy
-alias. The burst is fixed at $10\times$ from elapsed seconds 30 through 60, so use a duration
+alias. Defaults are 500 devices, a 90-second duration, and 64 connections when using the legacy
+`--concurrency` setting. Use `--chart-rate-limit <rate>` to apply one fixed rate/s ceiling to
+all dashboard charts; without it, each chart uses a rounded ceiling with 20% headroom and a
+minimum of 100 rate/s. The burst is fixed at $10\times$ from elapsed seconds 30 through 60, so use a duration
 greater than 60 seconds for a complete burst. The report includes request and sampled SSE latency,
-counter deltas, queue-depth peaks, and final queue depths.
+and writes a self-contained HTML dashboard to `loadtest-dashboard.html` by default; use
+`--report <path>` to choose another location. The dashboard shows stock-style, elapsed-time rate
+charts for accepted ingress requests, committed SQLite batches, and worker-handled events. Each
+chart has a left rate/s axis, right queue-depth axis, queue-pressure area, burst shading, and a
+hover tooltip with elapsed time, rate, and queue depth; it also includes generated per-room traffic
+distribution: an all-room profile sorted from busiest to quietest and horizontal bars for the ten
+rooms with the most dispatched events. Metric summaries report counters as first-to-last deltas and gauges
+(queue/activity/age/p95/last-batch measurements) as both sampled maxima and final values.
 
 ## Testing
 
