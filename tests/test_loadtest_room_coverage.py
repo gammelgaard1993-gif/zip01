@@ -1,6 +1,6 @@
 import unittest
 
-from _loadtest import Stats, build_dashboard_html, build_pressure_graph, build_rooms_to_watch, summarize_metrics
+from helpers._loadtest import Stats, build_dashboard_html, build_pressure_graph, build_rooms_to_watch, summarize_metrics
 
 
 class LoadTestRoomCoverageTests(unittest.TestCase):

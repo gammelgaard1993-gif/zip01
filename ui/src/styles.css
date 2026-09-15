@@ -1,0 +1,67 @@
+/* Shared design tokens — kept in sync with assets/styles.css. Task 2 will restyle
+   both to the dark-neon theme; for now this mirrors the current light theme so the
+   scaffold renders consistently with the generated loadtest dashboard. */
+:root {
+  color-scheme: light;
+  --ink: #182027;
+  --muted: #64707a;
+  --paper: #f5f4ee;
+  --panel: #fffefa;
+  --line: #d7d4ca;
+  --blue: #1677b8;
+  --green: #178056;
+  --orange: #d56b22;
+  --high: #bd3043;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  background-color: var(--paper);
+  background-image: radial-gradient(#d9d6cc 0.7px, transparent 0.7px);
+  background-size: 14px 14px;
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+main { max-width: 1440px; margin: 0 auto; padding: 32px; }
+h1 { font-size: 28px; margin: 0 0 4px; font-weight: 600; }
+p { color: var(--muted); margin: 0 0 8px; }
+
+.controls {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: end;
+  margin-top: 20px; padding: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+label { display: grid; gap: 4px; color: var(--muted); font: 12px ui-monospace, Consolas, monospace; }
+select, input {
+  min-width: 130px; height: 30px; padding: 0 6px;
+  border: 1px solid #aeb7ba; border-radius: 3px;
+  background: var(--panel); color: var(--ink);
+  font: 13px ui-monospace, Consolas, monospace;
+}
+label.checkbox { display: flex; flex-direction: row; align-items: center; gap: 6px; }
+label.checkbox input { min-width: 0; height: auto; }
+button {
+  height: 32px; padding: 0 16px; border: 1px solid var(--ink); border-radius: 4px;
+  background: var(--ink); color: var(--panel); font: 13px ui-monospace, Consolas, monospace;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+
+.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.kpi { padding: 12px; background: #182027; color: #fffefa; border-radius: 5px; min-width: 0; }
+.kpi span { display: block; color: #bec8c7; font: 11px ui-monospace, Consolas, monospace; }
+.kpi strong { display: block; margin-top: 3px; font: 21px Georgia, serif; font-weight: 600; }
+.kpi button { background: transparent; color: #fffefa; border-color: #bec8c7; }
+
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 24px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 16px; min-width: 0; box-shadow: 3px 3px 0 rgba(24, 32, 39, 0.06);
+}
+
+@media (max-width: 900px) {
+  main { padding: 18px; }
+  .grid, .kpis { grid-template-columns: 1fr; }
+}

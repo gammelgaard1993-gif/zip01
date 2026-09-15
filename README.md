@@ -57,8 +57,9 @@ alias. Defaults are 500 devices, a 90-second duration, and 64 connections when u
 all dashboard charts; without it, each chart uses a rounded ceiling with 20% headroom and a
 minimum of 100 rate/s. The burst is fixed at $10\times$ from elapsed seconds 30 through 60, so use a duration
 greater than 60 seconds for a complete burst. The report includes request and sampled SSE latency,
-and writes a self-contained HTML dashboard to `loadtest-dashboard.html` by default; use
-`--report <path>` to choose another location. The dashboard shows stock-style, elapsed-time rate
+and writes an HTML dashboard to `loadtest-dashboard.html` by default; use
+`--report <path>` to choose another location. The report links the shared
+[assets/styles.css](assets/styles.css) stylesheet, which is copied next to the report on each run. The dashboard shows stock-style, elapsed-time rate
 charts for accepted ingress requests, committed SQLite batches, and worker-handled events. Each
 chart has a left rate/s axis, right queue-depth axis, queue-pressure area, burst shading, and a
 hover tooltip with elapsed time, rate, and queue depth; it also includes generated per-room traffic

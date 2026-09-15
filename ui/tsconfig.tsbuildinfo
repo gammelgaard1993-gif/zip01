@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/api/client.ts","./src/api/stream.ts","./src/api/types.ts","./src/components/livedashboard.tsx","./src/components/runconfigform.tsx","./src/components/runstatus.tsx","./src/components/charts/stagechart.tsx","./vite.config.ts"],"version":"5.9.3"}
