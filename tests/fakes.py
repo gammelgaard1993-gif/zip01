@@ -295,6 +295,7 @@ class FakeIngestRequest:
         headers: dict[str, str] | None = None,
         db_connection: sqlite3.Connection | None = None,
         worker_pool: Any | None = None,
+        server: Any | None = None,
     ) -> None:
         self._body = body
         self.headers = Headers(headers or {})
@@ -304,6 +305,7 @@ class FakeIngestRequest:
                 event_queue=event_queue,
                 db_connection=self.db_connection,
                 worker_pool=worker_pool,
+                server=server,
             )
         )
 

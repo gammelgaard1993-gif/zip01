@@ -31,9 +31,9 @@ Taken together, these invariants explain why the challenge is scored on the full
 ```text
 POST /events
   └─ validate ──> persist to SQLite ──> enqueue (HIGH/NORMAL)
-      └─ worker router (device-hash) ──> per-device reorder buffer (5ms)
+      └─ worker router (device-hash) ──> per-device reorder buffer (100ms)
             └─ handlers (Redis hot state + alarm publication)
-                 └─ per-room alarm buffer (5ms) ──> SSE subscribers / replay
+                 └─ per-room alarm buffer (100ms) ──> SSE subscribers / replay
 ```
 
 ## Runtime Composition
@@ -112,7 +112,7 @@ Shutdown sequence:
     (`fall_warn`) is drained before NORMAL, so downstream routing preserves priority and cannot
     grow an unbounded FIFO; a full worker NORMAL lane backpressures the router (and thus ingress).
   - Keeps a per-device reorder buffer that sorts by `ts`, optional `seq`, then durable event ID before applying handlers.
-  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 5ms).
+  - Flushes after the reorder delay (`DEVICE_REORDER_BUFFER_MS`, 100ms).
   - Ordering guarantee is bounded to that window: an event arriving after its device's buffer
     already flushed is applied out of `ts` order relative to already-handled events (never
     dropped). Correctness of derived state is preserved by ts-aware, idempotent handlers rather
@@ -139,11 +139,35 @@ Shutdown sequence:
 
 - `processing.alarm_bus.AlarmBus`
   - Per-room subscribers with async queues.
-  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 5ms).
+  - Per-room reorder buffering before publish (`ALARM_REORDER_BUFFER_MS`, 100ms).
   - `subscribe(room_id)` registers the new queue and, under the same lock, replays any alarms
-    already held in `_room_buffers[room_id]` into it, so a subscriber arriving after `publish()`
-    but before the `_dispatch_room` snapshot does not miss in-flight alarms.
+    already claimed as `_inflight_batches[room_id]` into it, so a subscriber arriving mid-dispatch
+    doesn't miss them. `_dispatch_room` takes its delivery-time subscriber snapshot atomically (in
+    the same lock acquisition as marking the batch in-flight), before any reorder-delay sleep, so
+    a queue that subscribes afterward is guaranteed to be excluded from that snapshot and only
+    ever receives the batch via this replay path -- never both. Deliberately does NOT replay from
+    `_room_buffers`: any alarm still sitting there always has a pending dispatch task backing it
+    (guaranteed by `publish()`), and that task's own future atomic snapshot will already include a
+    subscriber that joined before it runs, so replaying here too would double-deliver. (An earlier
+    version of this logic replayed from both `_inflight_batches` and `_room_buffers`, and took the
+    delivery snapshot fresh after the reorder-delay sleep -- both were real, reproducible
+    double-delivery bugs found via specialist review; see `tests/test_alarms.py`'s
+    `AlarmBusCrossInstanceBridgeTests`/late-subscriber regression tests.)
   - Supports stream consumption used by SSE endpoint.
+  - **Cross-instance bridge**: when constructed with a redis client (the default in `api/app.py`,
+    since Redis is already a required shared dependency), a dispatched batch is always delivered
+    to this instance's local subscribers first, synchronously -- identical timing/atomicity to
+    the pre-bridge behavior, so `subscribe()`'s in-flight-batch replay handoff is unaffected by
+    redis latency. It is then also PUBLISHed to an `alarms:{room_id}` Redis channel, tagged with
+    this instance's id, purely so *other* instances' background listener threads (subscribed via
+    `psubscribe("alarms:*")`) can relay it to their own local subscribers; a listener ignores
+    messages tagged with its own instance id, since that instance already delivered the batch
+    directly. This is what lets an SSE client connected to any instance receive alarms processed
+    by any other instance, without ever double-delivering to a subscriber on the originating
+    instance. `AlarmBus.start()` blocks until its listener thread's `psubscribe` is acknowledged,
+    so an instance never begins publishing before it is guaranteed to receive other instances'
+    alarms. See "Multi-Instance Considerations" below. Unit tests construct `AlarmBus()` with no
+    redis client, which keeps the pre-bridge direct-delivery behavior unchanged.
 
 ### API
 
@@ -170,3 +194,55 @@ Routes in `api/routes/*`:
   - Uses inclusive replay boundary on ingestion order (`received_at >= snapshot_ts`), so late
     events ingested after the snapshot are replayed instead of dropped.
   - Runs periodic snapshot loop.
+  - **Known trade-off**: `snapshot_ts` is pinned to the oldest currently in-flight event's
+    `received_at` (never a plain wall-clock time), guaranteeing no admitted-but-unprocessed event
+    is ever excluded from replay. Under sustained backlog this can lag "now" by a large margin,
+    which inflates (but never breaks) the recovery replay window -- a deliberate
+    correctness-over-recovery-time choice, not an oversight. `RecoveryManager.metrics_snapshot()`
+    exposes `snapshot_lag_ms` (surfaced on `GET /metrics`) so a growing lag is observable instead
+    of assumed bounded; a `snapshot_lag_high` warning logs when it exceeds several snapshot
+    intervals.
+
+## Multi-Instance Considerations
+
+This project's reference design (per `REQUIREMENTS.md`) is a single process: one in-process
+priority queue, one dedicated SQLite writer thread, one in-memory alarm bus. The notes below
+record what's already safe under multiple instances, what required the pub/sub bridge above, and
+what would still need attention before running N replicas behind a load balancer -- kept here as
+a known-scope record, not as a statement that multi-instance is required or fully implemented.
+
+- **Already safe under concurrent multi-writer access, no changes needed**:
+  - `PresenceHandler`'s Redis `WATCH`/`MULTI` optimistic transactions on room presence/occupancy
+    are commutative and convergent regardless of which instance or in what order updates land
+    (`presence_watch_conflicts` counts retries).
+  - `FallWarnHandler` dedup is anchored on SQLite's `dedup_key` UNIQUE constraint -- authoritative
+    regardless of which instance's writer thread executes the insert first.
+  - `GET /rooms/{room_id}/occupancy` and `GET /devices/{device_id}/health` read directly from
+    Redis and are safe under arbitrary (non-sticky) load balancing today.
+
+- **Fixed by the AlarmBus redis pub/sub bridge (see above)**: SSE alarm delivery no longer
+  requires a client's stream connection and the alarm's originating instance to be the same
+  process.
+
+- **Still requires sticky (consistent-hash by `device_id`/`room_id`) routing at the load balancer
+  to keep the *literal* bounded-reorder-window guarantee true fleet-wide**: `DEVICE_REORDER_BUFFER_MS`
+  and `ALARM_REORDER_BUFFER_MS` are each a single process's reorder window. Without sticky routing,
+  a device's or room's events split across instances would each run an independent 100ms window
+  racing the others -- final state still converges correctly (the sinks above are commutative/
+  idempotent), but the specific "ordered within 100ms" claim degrades to "eventually consistent,
+  order not strictly bounded across instances." Sticky routing is an LB/ops concern, not an
+  application change.
+
+- **Not addressed, and would need design work before running multiple durable-writer instances**:
+  - SQLite's single-dedicated-writer-thread model doesn't corrupt under N processes writing the
+    same file (WAL locking still serializes them correctly), but it doesn't scale with instance
+    count either -- more processes means more small, lock-contending commits instead of amortized
+    batching, and a real multi-host deployment would need a shared disk with correct POSIX
+    advisory locking (most network-mounted filesystems don't provide this). The realistic paths
+    are "single writer instance + N stateless reader instances" or replacing SQLite with a store
+    built for concurrent multi-writer durability.
+  - Periodic snapshot capture (`RecoveryManager.start_snapshot_loop`) is not coordinated across
+    instances: each instance snapshots on its own timer against its own in-flight watermark, and
+    `state_snapshots` retention (newest N rows) doesn't distinguish which instance wrote a row.
+    This is unverified-safe, not proven-safe, under N concurrent snapshotters and would need
+    either a designated single snapshot-writer role or a fleet-wide (minimum) watermark.

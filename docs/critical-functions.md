@@ -54,7 +54,9 @@ Outputs:
 - `202 Accepted` (`{"status": "accepted"}`) on success; `202` with
   `{"status": "rejected", "reason": ...}` on clock-skew rejects; `413`
   (`{"error": "payload_too_large"}`) on oversized bodies; `400` on invalid JSON or schema;
-  `503` (`{"error": "persist_failed"}`) when the durable write fails.
+  `503` (`{"error": "persist_failed"}`) when the durable write fails; `503`
+  (`{"error": "enqueue_failed"}`) when an unexpected (non-storage) error prevents enqueueing an
+  already-persisted event.
 
 Side effects:
 
@@ -70,7 +72,16 @@ Side effects:
   event is neither enqueued nor accepted.
 - `_await_admission` shields the combined persist-and-enqueue task. Request cancellation is
   propagated only after admission finishes, preventing a committed event from being abandoned
-  before queue insertion. Unexpected post-persist queue failures count `events_enqueue_failed`.
+  before queue insertion. Unexpected post-persist queue failures count `events_enqueue_failed`,
+  log at `CRITICAL`, deliberately leave the event's in-flight marker set (so the snapshot
+  watermark can never advance past it), and request a controlled process shutdown via
+  `app.state.server.should_exit` (see `main.py`/`app.py`) so a restart's recovery replay -- which
+  reads directly from the durable `events` table -- re-applies the event. Continuing to run with
+  a persisted-but-never-applied event and a permanently frozen watermark is worse than a
+  restart. The route still returns the standard `503` (`{"error": "enqueue_failed"}`) envelope to
+  the caller rather than an unenveloped framework error, even though the process is shutting
+  down -- a retry is harmless (the event is either not yet durable, or durable and a retry just
+  adds a duplicate row).
 - Registers the event's `received_at` in the worker pool before persistence. A pre-persist failure
   removes it immediately; normal processing removes it after the handler completes or fails.
 - Increments `events_ingested_total`, reject counters, and `queue_pressure` when the NORMAL

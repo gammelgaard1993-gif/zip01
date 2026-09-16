@@ -31,7 +31,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.db_connection = init_db()
     app.state.redis_client = get_redis_client()
-    app.state.alarm_bus = AlarmBus()
+    # Redis is already a shared/required backing store, so wiring it into AlarmBus enables the
+    # cross-instance pub/sub bridge unconditionally (see processing/alarm_bus.py): an SSE client
+    # connected to any instance receives alarms regardless of which instance processed the
+    # originating event. Single-instance deployments pay a small extra Redis round trip for this;
+    # well within the 1s p95 alarm SLO on a local Redis.
+    app.state.alarm_bus = AlarmBus(redis_client=app.state.redis_client)
     app.state.event_queue = PriorityEventQueue(NORMAL_QUEUE_MAX_SIZE)
 
     # Phase 6 (#13): a dedicated single-writer thread (own SQLite connection) batches durable
@@ -63,6 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await recovery_manager.restore_state()
     await recovery_manager.start_snapshot_loop()
 
+    await app.state.alarm_bus.start()
     await app.state.worker_pool.start()
     try:
         yield
@@ -70,6 +76,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         worker_pool = getattr(app.state, "worker_pool", None)
         if worker_pool is not None:
             await worker_pool.stop()
+
+        alarm_bus = getattr(app.state, "alarm_bus", None)
+        if alarm_bus is not None:
+            await alarm_bus.stop()
 
         recovery_manager = getattr(app.state, "recovery_manager", None)
         if recovery_manager is not None:

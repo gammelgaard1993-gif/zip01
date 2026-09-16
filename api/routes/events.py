@@ -21,6 +21,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _trigger_fatal_shutdown(app_state: Any, context: dict[str, Any]) -> None:
+    """Request a controlled process shutdown after an unrecoverable admission bug.
+
+    Reached only when an event is durably persisted (persisted=True) but then fails to enqueue
+    for a reason other than a known SQLite error -- i.e. an unexpected bug, not a normal
+    operating condition (event_queue.put() awaits on backpressure, it never raises for a full
+    queue). The event's mark_inflight() entry is deliberately left in place (never unmark_inflight
+    here): clearing it would let the snapshot watermark advance past an event that never reached
+    a worker, permanently losing its effect on hot state on a future crash. Leaving it pinned
+    instead guarantees _current_snapshot_ts() never passes this event, so a restart's recovery
+    replay (core.recovery.RecoveryManager._replay_events, which reads directly from the durable
+    `events` table) is guaranteed to pick it up and apply it -- but only across an actual restart.
+    Continuing to run with a stuck watermark is worse than restarting, so this asks the server to
+    shut down. Requires app.state.server (see main.py/app.py) exposing should_exit; without it,
+    the process cannot self-restart and this only logs.
+    """
+    logger.critical(
+        json.dumps(
+            {
+                "event": "fatal_enqueue_failure",
+                "reason": "persisted_event_never_enqueued",
+                **context,
+            }
+        ),
+        exc_info=True,
+    )
+    server = getattr(app_state, "server", None)
+    if server is not None:
+        server.should_exit = True
+    else:
+        logger.critical(
+            json.dumps({"event": "fatal_shutdown_unavailable", "reason": "no_server_handle"})
+        )
+
+
 async def _await_admission(task: asyncio.Task[None]) -> None:
     """Finish durable admission before propagating request cancellation."""
     try:
@@ -183,10 +218,16 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
             raise
         except Exception:
             if persisted:
+                # Not a known storage error: the event is durably logged but never reached a
+                # worker. Deliberately does NOT unmark_inflight -- see _trigger_fatal_shutdown.
                 increment_counter("events_enqueue_failed")
-                logger.exception(
-                    "durable event could not be enqueued",
-                    extra={"device_id": validated.device_id, "event_type": validated.type},
+                _trigger_fatal_shutdown(
+                    request.app.state,
+                    {
+                        "device_id": validated.device_id,
+                        "event_type": validated.type,
+                        "received_at": received_at_iso,
+                    },
                 )
             elif worker_pool is not None:
                 worker_pool.unmark_inflight(received_at_iso)
@@ -199,9 +240,19 @@ async def ingest_event(request: Request, response: Response) -> dict[str, Any]:
     admission_task = asyncio.create_task(persist_and_enqueue())
     try:
         await _await_admission(admission_task)
-    except (sqlite3.Error, SQLiteWriterError) as exc:
+    except (sqlite3.Error, SQLiteWriterError):
         response.status_code = 503
         return {"error": "persist_failed"}
+    except Exception:
+        # Reaches here only after persist_and_enqueue's own except Exception branch already ran
+        # (logged critical, retained the in-flight marker if persisted, and requested a fatal
+        # shutdown when the event was durably persisted -- see _trigger_fatal_shutdown). The
+        # client still deserves the project's normal error envelope/status rather than an
+        # unenveloped framework 500: the event is either not persisted (safe to retry) or
+        # durably persisted (a retry is harmless, just a duplicate durable row) -- either way a
+        # 503 with a documented slug is accurate and consistent with the persist_failed case.
+        response.status_code = 503
+        return {"error": "enqueue_failed"}
 
     logger.info(
         json.dumps(

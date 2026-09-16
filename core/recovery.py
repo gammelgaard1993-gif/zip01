@@ -116,6 +116,14 @@ class RecoveryManager:
         # sized pools contending under load. Falls back to the default executor when None.
         self._redis_executor = redis_executor
         self._snapshot_task: asyncio.Task[None] | None = None
+        # Observability for the known correctness-over-recovery-time trade-off: snapshot_ts is
+        # pinned to the oldest in-flight event's received_at, which can lag far behind "now" under
+        # backlog (see docs/architecture.md). Surfaced via metrics_snapshot() / GET /metrics so a
+        # growing replay window is visible/alertable rather than silently assumed bounded.
+        self._last_snapshot_lag_ms: int = 0
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return {"snapshot_lag_ms": self._last_snapshot_lag_ms}
 
     async def restore_state(self) -> None:
         redis_client = cast(_RecoveryRedis, self.redis)
@@ -175,6 +183,7 @@ class RecoveryManager:
                 # _replay_events). Both the Redis capture and the SQLite write run in the executor
                 # so neither can freeze the event loop during a snapshot cycle.
                 snapshot_ts = self._current_snapshot_ts()
+                self._record_snapshot_lag(snapshot_ts)
                 state_json = await loop.run_in_executor(self._redis_executor, self._capture_state_json)
                 # Offload the SQLite write so the snapshot commit never freezes the event loop.
                 await loop.run_in_executor(
@@ -189,7 +198,33 @@ class RecoveryManager:
 
     def write_snapshot(self) -> None:
         # Synchronous, on-demand snapshot (e.g. graceful shutdown); the periodic path is _snapshot_loop.
-        self._persist_snapshot(self._current_snapshot_ts(), self._capture_state_json())
+        snapshot_ts = self._current_snapshot_ts()
+        self._record_snapshot_lag(snapshot_ts)
+        self._persist_snapshot(snapshot_ts, self._capture_state_json())
+
+    def _record_snapshot_lag(self, snapshot_ts: str) -> None:
+        # snapshot_ts pinned to a stale in-flight watermark inflates the recovery replay window
+        # without breaking correctness (see _current_snapshot_ts); this gauge makes that lag
+        # observable instead of assumed bounded. A parse failure must never break snapshotting.
+        try:
+            stamped = datetime.fromisoformat(snapshot_ts).astimezone(timezone.utc)
+            lag_ms = int((datetime.now(timezone.utc) - stamped).total_seconds() * 1000)
+        except (ValueError, TypeError):
+            return
+        self._last_snapshot_lag_ms = max(0, lag_ms)
+        # Heuristic threshold: lag beyond a few snapshot intervals means backlog dwell time, not
+        # normal jitter, is driving the watermark -- worth a warning, not a hard limit.
+        warning_threshold_ms = STATE_SNAPSHOT_INTERVAL_SECONDS * 1000 * 3
+        if self._last_snapshot_lag_ms > warning_threshold_ms:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "snapshot_lag_high",
+                        "snapshot_ts": snapshot_ts,
+                        "snapshot_lag_ms": self._last_snapshot_lag_ms,
+                    }
+                )
+            )
 
     def _current_snapshot_ts(self) -> str:
         # Replay cutoff = oldest in-flight event's received_at (falling back to now when nothing is

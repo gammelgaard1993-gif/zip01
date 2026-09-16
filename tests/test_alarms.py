@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, cast
@@ -195,50 +197,53 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         live_payload = json.loads(second_chunk.removeprefix("data: ").strip())
         self.assertEqual(live_payload["room_id"], room_id)
 
+    async def test_subscriber_joining_immediately_after_publish_is_not_double_delivered(self) -> None:
+        # Targets the specific pre-claim window a specialist review flagged: subscribe() racing
+        # publish() before the scheduled dispatch task has had a chance to run at all (so the
+        # batch is still sitting in _room_buffers, not yet in _inflight_batches). subscribe() no
+        # longer replays from _room_buffers (see AlarmBus.subscribe's docstring/comment) -- the
+        # correctness argument is that a subscriber that wins the race and joins _subscribers
+        # before the dispatch task claims the batch is naturally included in that task's own
+        # (still-to-come) atomic snapshot, so it must get exactly one delivery, not zero and not
+        # two.
+        alarm_bus = AlarmBus()
+        room_id = "room_pre_claim_race"
+        alarm = AlarmEvent(
+            device_id="dev_pre_claim",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 15, 30, 0, tzinfo=timezone.utc),
+            confidence=0.88,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        await alarm_bus.publish(alarm)  # schedules but does not run the dispatch task yet
+        queue = await alarm_bus.subscribe(room_id)  # wins the race, joins before the task runs
+
+        received = await asyncio.wait_for(queue.get(), timeout=1.0)
+        self.assertEqual(received.device_id, alarm.device_id)
+        await asyncio.sleep(0.05)  # let the dispatch task actually run and finish
+        self.assertTrue(queue.empty(), "alarm must be delivered exactly once, not duplicated by the dispatch task")
+
     async def test_alarm_bus_replays_current_dispatch_batch_to_late_subscribers(self) -> None:
-        class PausingAlarmBus(AlarmBus):
+        # Uses the real _dispatch_room (not a reimplementation of it) and only pauses right
+        # before _broadcast's actual delivery, so a subscriber can join in the exact window this
+        # is meant to cover: after the batch is marked in-flight (and, for a real reorder-delayed
+        # batch, during the reorder-delay sleep) but before delivery happens. Asserting the queue
+        # is empty after the one expected item guards against the double-delivery regression a
+        # specialist review found in an earlier version of this dispatch path (subscribe()'s
+        # in-flight replay racing a late-taken subscriber snapshot in delivery).
+        class PausingBroadcastAlarmBus(AlarmBus):
             def __init__(self) -> None:
                 super().__init__()
-                self._release_delivery = asyncio.Event()
-                self._delivery_started = asyncio.Event()
+                self._broadcast_started = asyncio.Event()
+                self._release_broadcast = asyncio.Event()
 
-            async def wait_for_delivery_started(self) -> None:
-                await self._delivery_started.wait()
+            async def _broadcast(self, room_id: str, alarms: list[AlarmEvent], subscriber_queues: Any) -> None:
+                self._broadcast_started.set()
+                await self._release_broadcast.wait()
+                await super()._broadcast(room_id, alarms, subscriber_queues)
 
-            def release_delivery(self) -> None:
-                self._release_delivery.set()
-
-            def seed_room_buffer(self, room_id: str, alarms: list[AlarmEvent]) -> None:
-                self._room_buffers[room_id] = list(alarms)
-
-            async def _dispatch_room(self, room_id: str) -> None:
-                current_task = asyncio.current_task()
-                try:
-                    async with self._lock:
-                        room_buffer = self._room_buffers.get(room_id, [])
-                        if not room_buffer:
-                            return
-                        alarms_to_publish = list(room_buffer)
-                        self._room_buffers[room_id] = []
-                        self._inflight_batches[room_id] = alarms_to_publish
-                        self._delivery_started.set()
-
-                    await self._release_delivery.wait()
-
-                    async with self._lock:
-                        subscriber_queues = list(self._subscribers.get(room_id, []))
-
-                    for alarm in alarms_to_publish:
-                        for queue in list(subscriber_queues):
-                            queue.put_nowait(alarm)
-                finally:
-                    async with self._lock:
-                        self._inflight_batches.pop(room_id, None)
-                        mapped_task = self._dispatch_tasks.get(room_id)
-                        if mapped_task is current_task:
-                            self._dispatch_tasks.pop(room_id, None)
-
-        alarm_bus: PausingAlarmBus = PausingAlarmBus()
+        alarm_bus = PausingBroadcastAlarmBus()
         room_id = "room_late_subscriber"
         alarm = AlarmEvent(
             device_id="dev_late",
@@ -249,21 +254,73 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await alarm_bus.publish(alarm)
-        await asyncio.wait_for(alarm_bus.wait_for_delivery_started(), timeout=1.0)
+        await asyncio.wait_for(alarm_bus._broadcast_started.wait(), timeout=1.0)
 
         queue = await alarm_bus.subscribe(room_id)
-        alarm_bus.release_delivery()
+        alarm_bus._release_broadcast.set()
 
         received = await asyncio.wait_for(queue.get(), timeout=1.0)
         self.assertEqual(received.device_id, alarm.device_id)
+        self.assertTrue(queue.empty(), "late subscriber must receive the in-flight batch exactly once")
+
+    async def test_late_subscriber_during_real_reorder_delay_is_not_double_delivered(self) -> None:
+        # Companion to the test above, using a real (non-zero) reorder-delay sleep with a
+        # multi-alarm batch instead of an artificial _broadcast pause -- this is the exact shape
+        # a specialist review used to prove that only moving the subscriber snapshot's *position*
+        # in _dispatch_room (independent of how it's threaded into _broadcast/_deliver_local)
+        # actually closes the race for delayed batches; a single-alarm/no-delay test alone cannot
+        # tell the two apart.
+        alarm_bus = AlarmBus()
+        alarm_bus._reorder_buffer_seconds = 0.15
+        room_id = "room_real_reorder_delay"
+        base_ts = datetime(2026, 6, 29, 15, 0, 0, tzinfo=timezone.utc)
+        first_alarm = AlarmEvent(
+            device_id="dev_reorder_1",
+            room_id=room_id,
+            ts=base_ts,
+            confidence=0.9,
+            received_at=datetime.now(timezone.utc),
+        )
+        second_alarm = AlarmEvent(
+            device_id="dev_reorder_2",
+            room_id=room_id,
+            ts=base_ts + timedelta(seconds=1),
+            confidence=0.92,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        await alarm_bus.publish(first_alarm)
+        await alarm_bus.publish(second_alarm)
+        await asyncio.sleep(0.05)  # join well inside the real 150ms reorder-delay window
+        queue = await alarm_bus.subscribe(room_id)
+
+        received_first = await asyncio.wait_for(queue.get(), timeout=1.0)
+        received_second = await asyncio.wait_for(queue.get(), timeout=1.0)
+        self.assertEqual({received_first.device_id, received_second.device_id}, {"dev_reorder_1", "dev_reorder_2"})
+        await asyncio.sleep(0.2)  # let dispatch fully finish before checking for stray duplicates
+        self.assertTrue(queue.empty(), "batch must be delivered exactly once, not duplicated by live delivery")
 
     async def test_replay_to_full_subscriber_queue_is_buffered_until_drained(self) -> None:
-        class SeedableAlarmBus(AlarmBus):
-            def seed_room_buffer(self, room_id: str, alarms: list[AlarmEvent]) -> None:
-                self._room_buffers[room_id] = list(alarms)
+        # Uses the real dispatch/publish flow (not manually seeded _room_buffers, which -- after
+        # the fix removing subscribe()'s _room_buffers replay -- would never be delivered, since
+        # normally a non-empty room_buffer always has a pending dispatch task backing it). Pauses
+        # inside an overridden _broadcast so the subscriber joins while both alarms are held in
+        # _inflight_batches (after the dispatch task's atomic snapshot, which was empty, was
+        # already taken), so it must receive both alarms via subscribe()'s in-flight replay --
+        # exercising the same queue-full/backlog-buffering path the original test covered.
+        class PausingBroadcastAlarmBus(AlarmBus):
+            def __init__(self) -> None:
+                super().__init__()
+                self._broadcast_started = asyncio.Event()
+                self._release_broadcast = asyncio.Event()
+
+            async def _broadcast(self, room_id: str, alarms: list[AlarmEvent], subscriber_queues: Any) -> None:
+                self._broadcast_started.set()
+                await self._release_broadcast.wait()
+                await super()._broadcast(room_id, alarms, subscriber_queues)
 
         with patch("processing.alarm_bus.SSE_SUBSCRIBER_QUEUE_MAX_SIZE", 1):
-            alarm_bus: SeedableAlarmBus = SeedableAlarmBus()
+            alarm_bus = PausingBroadcastAlarmBus()
             room_id = "room_buffered_replay"
             first_alarm = AlarmEvent(
                 device_id="dev_buffered_1",
@@ -279,9 +336,16 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
                 confidence=0.95,
                 received_at=datetime.now(timezone.utc),
             )
-            alarm_bus.seed_room_buffer(room_id, [first_alarm, second_alarm])
+            # Both publish() calls run to completion before the dispatch task they schedule gets
+            # a chance to run (no real suspension point in between), so the dispatch task sees
+            # both alarms as a single (delayed, since len > 1) batch, matching the original
+            # test's two-alarm-batch intent.
+            await alarm_bus.publish(first_alarm)
+            await alarm_bus.publish(second_alarm)
+            await asyncio.wait_for(alarm_bus._broadcast_started.wait(), timeout=1.0)
 
             queue = cast(Any, await alarm_bus.subscribe(room_id))
+            alarm_bus._release_broadcast.set()
 
             self.assertEqual(queue.qsize(), 1)
             self.assertGreaterEqual(queue.pending_count(), 2)
@@ -291,6 +355,7 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
 
             second = await asyncio.wait_for(queue.get(), timeout=1.0)
             self.assertEqual(second.device_id, second_alarm.device_id)
+            self.assertTrue(queue.empty(), "alarms must be delivered exactly once, not duplicated by live delivery")
 
     async def test_alarm_stream_records_sse_delivery_latency(self) -> None:
         alarm_bus = AlarmBus()
@@ -572,6 +637,155 @@ class AlarmRoutesTests(unittest.IsolatedAsyncioTestCase):
         # The generator yields whatever made it into the queue before eviction, then breaks
         # instead of hanging forever once it observes disconnected+drained.
         self.assertGreaterEqual(len(chunks), 1)
+
+
+class _FakeRedisPubSubBroker:
+    """Minimal in-memory PUBLISH/PSUBSCRIBE fanout shared by multiple fake redis client
+    handles, standing in for a real Redis server so the AlarmBus cross-instance bridge can be
+    tested without Docker/a live Redis connection (see core/redis_client.py's USE_FAKE_REDIS note
+    for why the app itself falls back to fakeredis, not this: this stub only needs to support the
+    narrow publish/psubscribe/get_message surface AlarmBus's bridge actually calls)."""
+
+    def __init__(self) -> None:
+        self._subscriber_queues: list[Any] = []
+        self._lock = threading.Lock()
+
+    def client(self) -> "_FakeRedisPubSubClient":
+        return _FakeRedisPubSubClient(self)
+
+
+class _FakeRedisPubSubClient:
+    def __init__(self, broker: _FakeRedisPubSubBroker) -> None:
+        self._broker = broker
+
+    def publish(self, channel: str, payload: str) -> None:
+        with self._broker._lock:
+            queues = list(self._broker._subscriber_queues)
+        for q in queues:
+            q.put({"type": "pmessage", "channel": channel, "data": payload})
+
+    def pubsub(self, ignore_subscribe_messages: bool = True) -> "_FakePubSubHandle":
+        return _FakePubSubHandle(self._broker)
+
+
+class _FakePubSubHandle:
+    def __init__(self, broker: _FakeRedisPubSubBroker) -> None:
+        self._broker = broker
+        self._queue: Any = None
+
+    def psubscribe(self, pattern: str) -> None:
+        import queue as queue_module
+
+        self._queue = queue_module.Queue()
+        with self._broker._lock:
+            self._broker._subscriber_queues.append(self._queue)
+
+    def get_message(self, timeout: float = 1.0) -> dict[str, Any] | None:
+        import queue as queue_module
+
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue_module.Empty:
+            return None
+
+    def close(self) -> None:
+        with self._broker._lock:
+            if self._queue in self._broker._subscriber_queues:
+                self._broker._subscriber_queues.remove(self._queue)
+
+
+class AlarmBusCrossInstanceBridgeTests(unittest.IsolatedAsyncioTestCase):
+    """Verifies the redis pub/sub bridge (processing/alarm_bus.py) fans an alarm published by
+    one AlarmBus "instance" out to a subscriber on a different AlarmBus "instance" sharing the
+    same (fake) redis backend -- the scenario that is broken without the bridge (see the
+    multi-instance architecture review: SSE delivery was previously per-process only)."""
+
+    async def asyncSetUp(self) -> None:
+        self.broker = _FakeRedisPubSubBroker()
+        self.bus_a = AlarmBus(redis_client=self.broker.client())
+        self.bus_b = AlarmBus(redis_client=self.broker.client())
+        await self.bus_a.start()
+        await self.bus_b.start()
+
+    async def asyncTearDown(self) -> None:
+        await self.bus_a.stop()
+        await self.bus_b.stop()
+
+    async def test_alarm_published_on_one_instance_is_delivered_to_subscriber_on_another(self) -> None:
+        room_id = "room_cross_instance"
+        subscriber_queue = await self.bus_b.subscribe(room_id)
+
+        alarm = AlarmEvent(
+            device_id="dev_cross_instance",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+            confidence=0.93,
+            received_at=datetime.now(timezone.utc),
+        )
+        await self.bus_a.publish(alarm)
+
+        received = await asyncio.wait_for(subscriber_queue.get(), timeout=2.0)
+        self.assertEqual(received.device_id, alarm.device_id)
+        self.assertEqual(received.room_id, room_id)
+
+    async def test_publishing_instance_also_receives_its_own_alarm_exactly_once(self) -> None:
+        # The publishing instance delivers its own batch directly/synchronously (see
+        # AlarmBus._broadcast) rather than round-tripping through its own bridge listener; the
+        # bridge PUBLISH is tagged with an instance id and the listener explicitly ignores
+        # self-originated messages so the local subscriber above is never double-delivered.
+        room_id = "room_self_delivery"
+        subscriber_queue = await self.bus_a.subscribe(room_id)
+
+        alarm = AlarmEvent(
+            device_id="dev_self_delivery",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+            confidence=0.91,
+            received_at=datetime.now(timezone.utc),
+        )
+        await self.bus_a.publish(alarm)
+
+        received = await asyncio.wait_for(subscriber_queue.get(), timeout=2.0)
+        self.assertEqual(received.device_id, alarm.device_id)
+        self.assertTrue(subscriber_queue.empty(), "alarm must be delivered exactly once, not twice")
+
+    async def test_late_subscriber_on_remote_instance_is_not_double_delivered_under_slow_publish(
+        self,
+    ) -> None:
+        # Regression test for a race a specialist review found in an earlier version of this
+        # bridge: _broadcast() used to only await the PUBLISH network call and rely on the
+        # listener thread to perform the actual local delivery later, asynchronously. A
+        # subscriber joining bus_b during that gap could observe both the in-flight-batch replay
+        # AND the deferred bridge delivery -- i.e. the same alarm twice. The fix makes local
+        # delivery on the publishing instance fully synchronous (independent of redis latency)
+        # and has remote instances' listeners ignore self-originated messages, so this scenario
+        # (artificially slow PUBLISH + a subscriber joining bus_b mid-flight) must still result
+        # in exactly one delivery to that subscriber.
+        original_publish = _FakeRedisPubSubClient.publish
+
+        def slow_publish(self_client: "_FakeRedisPubSubClient", channel: str, payload: str) -> None:
+            time.sleep(0.15)
+            original_publish(self_client, channel, payload)
+
+        room_id = "room_slow_publish_race"
+        alarm = AlarmEvent(
+            device_id="dev_slow_publish",
+            room_id=room_id,
+            ts=datetime(2026, 6, 29, 18, 0, 0, tzinfo=timezone.utc),
+            confidence=0.87,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        with patch.object(_FakeRedisPubSubClient, "publish", slow_publish):
+            publish_task = asyncio.create_task(self.bus_a.publish(alarm))
+            await asyncio.sleep(0.03)  # join bus_b well inside the artificial 150ms publish delay
+            subscriber_queue = await self.bus_b.subscribe(room_id)
+            await publish_task
+
+            received = await asyncio.wait_for(subscriber_queue.get(), timeout=2.0)
+            self.assertEqual(received.device_id, alarm.device_id)
+            await asyncio.sleep(0.05)
+            self.assertTrue(subscriber_queue.empty(), "alarm must be delivered exactly once, not twice")
 
 
 if __name__ == "__main__":

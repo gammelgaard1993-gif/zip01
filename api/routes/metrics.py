@@ -34,6 +34,9 @@ async def metrics(request: Request) -> MetricsResponse:
     worker_pool = getattr(request.app.state, "worker_pool", None)
     if worker_pool is not None:
         counters.update(worker_pool.metrics_snapshot())
+    recovery_manager = getattr(request.app.state, "recovery_manager", None)
+    if recovery_manager is not None:
+        counters.update(recovery_manager.metrics_snapshot())
     counters["alarm_feed_latency_ms_p95"] = get_alarm_feed_latency_ms_p95()
     counters["alarm_bus_dispatch_latency_ms_p95"] = get_alarm_path_stage_latency_ms_p95(
         "alarm_bus_dispatch"

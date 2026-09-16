@@ -50,6 +50,16 @@ class _AdmissionGateQueue(PriorityEventQueue):
         await super().put(event)
 
 
+class _FailingQueue(PriorityEventQueue):
+    """Simulates an unexpected (non-SQLite) bug in the post-persist enqueue path."""
+
+    def __init__(self) -> None:
+        super().__init__(100)
+
+    async def put(self, event: Any) -> None:
+        raise RuntimeError("unexpected enqueue bug")
+
+
 class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepts_valid_event_and_enqueues_with_derived_payload(self) -> None:
         queue = PriorityEventQueue(100)
@@ -148,6 +158,62 @@ class EventsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"error": "persist_failed"})
         self.assertTrue(queue.empty())
         self.assertIsNone(worker_pool.oldest_inflight_received_at())
+
+    async def test_enqueue_bug_after_persist_triggers_fatal_shutdown_and_keeps_inflight_marker(
+        self,
+    ) -> None:
+        # A persisted-but-unenqueued event must never silently disappear: the in-flight marker
+        # stays set (so the snapshot watermark can't skip past it -- recovery replay reads
+        # directly from the durable `events` table and will pick it up on restart), and the
+        # process requests a shutdown rather than continuing with a permanently frozen watermark.
+        # The client still gets the project's normal error envelope, not a bare framework 500.
+        queue = _FailingQueue()
+        worker_pool = _InflightTracker()
+        server = SimpleNamespace(should_exit=False)
+        db = new_events_db()
+        request = FakeIngestRequest(
+            flat_event("heartbeat"),
+            queue,
+            db_connection=db,
+            worker_pool=worker_pool,
+            server=server,
+        )
+        response = Response()
+
+        before = get_counters().get("events_enqueue_failed", 0)
+        result = await ingest_event(cast(Any, request), response)
+        after = get_counters().get("events_enqueue_failed", 0)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(result, {"error": "enqueue_failed"})
+        self.assertEqual(after - before, 1, "events_enqueue_failed must increment")
+        self.assertEqual(
+            db.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            1,
+            "event must still be durably persisted",
+        )
+        self.assertIsNotNone(
+            worker_pool.oldest_inflight_received_at(),
+            "in-flight marker must be retained, not cleared, for an unenqueued persisted event",
+        )
+        self.assertTrue(server.should_exit, "server must be asked to shut down")
+
+    async def test_enqueue_bug_after_persist_without_server_handle_still_returns_503(self) -> None:
+        # No app.state.server (e.g. app not started via main.py's entrypoint): must not itself
+        # raise while logging, and must still return the standard 503 envelope to the caller.
+        queue = _FailingQueue()
+        worker_pool = _InflightTracker()
+        db = new_events_db()
+        request = FakeIngestRequest(
+            flat_event("heartbeat"), queue, db_connection=db, worker_pool=worker_pool
+        )
+        response = Response()
+
+        result = await ingest_event(cast(Any, request), response)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(result, {"error": "enqueue_failed"})
+        self.assertIsNotNone(worker_pool.oldest_inflight_received_at())
 
     async def test_cancellation_while_queue_put_is_blocked_completes_admission(self) -> None:
         queue = _AdmissionGateQueue()

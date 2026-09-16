@@ -32,12 +32,12 @@ WORKER_NORMAL_QUEUE_MAX_SIZE = 100_000
 # congested at once. No cross-task ordering coordination is needed: per-device processing order
 # is decided by each event's own ts field (re-sorted in the worker pool), not by put() order.
 ROUTER_TASK_COUNT = 12
-# Two sequential reorder stages (per-device in the worker pool, per-room in the alarm bus)
-# sit on the alarm hot path. The previous 100ms budget was enough to preserve ordering but was
-# too large for the latency SLO under bursty traffic. Trimming this down makes the live path
-# respond sooner while still avoiding pathological out-of-order delivery.
-DEVICE_REORDER_BUFFER_MS = 5
-ALARM_REORDER_BUFFER_MS = 5
+# Two sequential reorder stages (per-device in the worker pool, per-room in the alarm bus) sit on
+# the alarm hot path. 100ms each is the bounded window a device's/room's events are held to sort
+# by ts before applying/dispatching (see REQUIREMENTS.md's per-device reorder buffer). Combined
+# worst case (~200ms) still leaves ample headroom under the 1s p95 alarm latency SLO.
+DEVICE_REORDER_BUFFER_MS = 100
+ALARM_REORDER_BUFFER_MS = 100
 ALARM_REPLAY_BATCH_SIZE = 500
 # Bound per-SSE-subscriber fan-out memory. A subscriber that stops draining its queue (stalled
 # connection, slow client) is evicted once full rather than growing this queue unbounded or

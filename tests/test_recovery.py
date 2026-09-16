@@ -484,6 +484,64 @@ class RecoveryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(stamped, before)
         self.assertLessEqual(stamped, after)
 
+    async def test_metrics_snapshot_reports_snapshot_lag_from_stale_inflight_watermark(
+        self,
+    ) -> None:
+        # A stale in-flight watermark inflates the recovery replay window without breaking
+        # correctness; snapshot_lag_ms makes that lag observable (see docs/architecture.md).
+        fake_redis = CaptureFakeRedis()
+        oldest_inflight = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: oldest_inflight,
+        )
+
+        self.assertEqual(manager.metrics_snapshot(), {"snapshot_lag_ms": 0})
+
+        manager.write_snapshot()
+
+        lag_ms = manager.metrics_snapshot()["snapshot_lag_ms"]
+        self.assertGreaterEqual(lag_ms, 29_000, f"expected ~30s lag, got {lag_ms}ms")
+
+    async def test_metrics_snapshot_ignores_malformed_watermark_without_raising(self) -> None:
+        # A watermark provider returning garbage must never break snapshotting (see the "a parse
+        # failure must never break snapshotting" comment in _record_snapshot_lag).
+        fake_redis = CaptureFakeRedis()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: "not-a-timestamp",
+        )
+
+        manager.write_snapshot()  # must not raise
+
+        self.assertEqual(manager.metrics_snapshot(), {"snapshot_lag_ms": 0})
+
+    async def test_metrics_snapshot_handles_naive_watermark_without_raising(self) -> None:
+        # A naive (no tzinfo) watermark must not raise TypeError when subtracted from an
+        # aware datetime.now(timezone.utc) -- parity with worker_pool.py's astimezone guard.
+        # (astimezone() interprets a naive value as local time, so the exact lag depends on the
+        # host's local timezone offset; this test only asserts it never raises and stays clamped
+        # to a non-negative value, not a specific magnitude.)
+        fake_redis = CaptureFakeRedis()
+        naive_inflight = (datetime.now(timezone.utc) - timedelta(seconds=10)).replace(
+            tzinfo=None
+        ).isoformat()
+        manager = RecoveryManager(
+            self.db,
+            cast(Any, fake_redis),
+            cast(Any, FakeAlarmBus()),
+            inflight_watermark_provider=lambda: naive_inflight,
+        )
+
+        manager.write_snapshot()  # must not raise
+
+        lag_ms = manager.metrics_snapshot()["snapshot_lag_ms"]
+        self.assertGreaterEqual(lag_ms, 0)
+
     async def test_malformed_snapshot_falls_back_to_full_replay(self) -> None:
         # Finding #6: a corrupt (unparseable) or non-dict snapshot must not crash startup and must
         # not keep its cutoff; recovery loads it as (None, None) so restore does a full replay.
