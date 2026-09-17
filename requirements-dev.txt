@@ -8,3 +8,6 @@ fakeredis==2.36.2
 
 # Starlette 1.x TestClient transport (required by fastapi.testclient).
 httpx2==2.9.1
+
+# Linting (CI quality gate; see pyproject.toml for the enabled rule set).
+ruff==0.16.7

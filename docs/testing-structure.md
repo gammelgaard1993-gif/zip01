@@ -44,14 +44,9 @@ an event arrives after its prior buffer has flushed.
 - Fast gate: foundation, ingestion, processing, core, and API contract tests.
 - Extended gate: integration, recovery, and backpressure-heavy scenarios.
 - Manual or scheduled: long-running load and resilience checks. The local correctness baseline is
-  **113 run: 112 passed, 1 optional real-Redis test skipped** without `TEST_REDIS_URL`; it does not by
+  **136 run: 135 passed, 1 optional real-Redis test skipped** without `TEST_REDIS_URL`; it does not by
   itself prove challenge-scale 5k/s baseline, 50k/s burst, or sustained p95 latency.
-- `helpers/_loadtest.py` is the manual concurrent load runner. It reports request throughput and
-  errors, POST and sampled fall-warning-to-SSE latency, and writes a self-contained HTML dashboard
-  to `loadtest-dashboard.html` by default (`--report <path>` overrides it). The dashboard filters
-  sampled charts by phase (all, baseline, burst, or after-drain) and pipeline stage (all, ingress,
-  SQLite writer, or workers), shows selected-sample ingress-rate, queue-depth, oldest-work-age,
-  and correctness-failure KPIs, and retains generated per-room traffic by second. Sampled metric
-  summaries use first-to-last deltas for counters and max/final values for
-  queue/activity/age/p95/last-batch gauges. It is a local measurement tool, not independent proof
-  of challenge-scale capacity.
+- `event_generator/generate.py` is the manual concurrent load runner (baseline/burst/offline/
+  adversarial modes; see `README.md`'s Quickstart/Makefile targets). `helpers/_bench.py` is a
+  minimal single-purpose throughput probe for quick local checks, not a full scenario runner. Both
+  are local measurement tools, not independent proof of challenge-scale capacity.

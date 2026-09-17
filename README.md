@@ -1,5 +1,7 @@
 ﻿# zip01
 
+[![CI](https://github.com/gammelgaard1993-gif/zip01/actions/workflows/ci.yml/badge.svg)](https://github.com/gammelgaard1993-gif/zip01/actions/workflows/ci.yml)
+
 Real-time streaming backend for sensor events with prioritized processing, Redis hot state, SQLite durability, and FastAPI APIs.
 
 ## Quickstart
@@ -42,29 +44,23 @@ HTTP `POST /events` is the primary transport (what the reference generator
 
 ### Concurrent Load Test
 
-The pooled local helper uses reusable HTTP connections and samples `/metrics` independently of
-the request pool. Install development dependencies first, then run it against a running service:
+Two tools are available for exercising the service under load; both require a running instance:
 
-```powershell
-python -m pip install -r requirements.txt -r requirements-dev.txt
-python helpers/_loadtest.py --devices 500 --duration 120 --connections 32 --metrics-interval 1
-python helpers/_loadtest.py --devices 500 --duration 90 --connections 32 --metrics-interval 1 --burst
-```
+- **`event_generator/generate.py`** — the reference load generator (see Quickstart above). Use
+  `--mode burst` or `--mode adversarial` with a higher `--devices` count to push backpressure,
+  then inspect `GET /metrics`, queue depth, drops, and alarm p95 directly.
+- **[helpers/_bench.py](helpers/_bench.py)** — a minimal single-endpoint throughput probe (fixed
+  200 sequential `POST /events` requests) for a quick req/s sanity check without installing dev
+  dependencies:
 
-`--connections` caps reusable concurrent POST connections; `--concurrency` remains a legacy
-alias. Defaults are 500 devices, a 90-second duration, and 64 connections when using the legacy
-`--concurrency` setting. Use `--chart-rate-limit <rate>` to apply one fixed rate/s ceiling to
-all dashboard charts; without it, each chart uses a rounded ceiling with 20% headroom and a
-minimum of 100 rate/s. The burst is fixed at $10\times$ from elapsed seconds 30 through 60, so use a duration
-greater than 60 seconds for a complete burst. The report includes request and sampled SSE latency,
-and writes a self-contained HTML dashboard to `loadtest-dashboard.html` by default; use
-`--report <path>` to choose another location. The dashboard shows stock-style, elapsed-time rate
-charts for accepted ingress requests, committed SQLite batches, and worker-handled events. Each
-chart has a left rate/s axis, right queue-depth axis, queue-pressure area, burst shading, and a
-hover tooltip with elapsed time, rate, and queue depth; it also includes generated per-room traffic
-distribution: an all-room profile sorted from busiest to quietest and horizontal bars for the ten
-rooms with the most dispatched events. Metric summaries report counters as first-to-last deltas and gauges
-(queue/activity/age/p95/last-batch measurements) as both sampled maxima and final values.
+  ```powershell
+  python helpers/_bench.py
+  ```
+
+A richer standalone load-test client with connection pooling, sampled `/metrics` polling, and an
+HTML rate/latency dashboard existed in earlier development but is not currently part of `main`; if
+you need that level of reporting, drive `event_generator/generate.py` and chart `/metrics` output
+yourself, or track it down on the branch it was built on.
 
 ## Testing
 
@@ -79,12 +75,19 @@ The test suite is organized by behavior layer so the project-level structure sta
 
 Shared test doubles and helper conventions are documented in [docs/testing-structure.md](docs/testing-structure.md).
 
-Current local result: **113 tests run: 112 passed, 1 optional real-Redis concurrency test skipped** when
-`TEST_REDIS_URL` is not configured. The suite verifies cancellation-safe admission and queueing,
-atomic presence updates, deterministic recovery, and API contracts. Challenge-scale throughput
-and sustained p95 latency are not established by the test suite. Use
-[helpers/_loadtest.py](helpers/_loadtest.py) for a local concurrent measurement; the supplied
-synchronous generator is useful for compatibility checks, not as proof of the 5k/s and 50k/s targets.
+Current local result: **136 tests run: 135 passed, 1 optional real-Redis concurrency test skipped**
+when `TEST_REDIS_URL` is not configured. The suite verifies cancellation-safe admission and
+queueing, atomic presence updates, deterministic recovery, and API contracts. Challenge-scale
+throughput and sustained p95 latency are not established by the test suite; see
+[helpers/_bench.py](helpers/_bench.py) for a minimal local throughput probe, or run
+`event_generator/generate.py` against a live instance for burst/offline/adversarial scenarios.
+
+### Continuous Integration
+
+Every push and pull request to `main` runs lint (`ruff`) and the full test suite via
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) (GitHub Actions, the pipeline that
+actually runs for this repo). An equivalent [`azure-pipelines.yml`](azure-pipelines.yml) is kept
+in sync as a like-for-like Azure DevOps translation of the same gate.
 
 ## AI Collaboration Template (v1)
 

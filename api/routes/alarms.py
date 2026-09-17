@@ -15,10 +15,10 @@ from pydantic import BaseModel
 import config
 from api.dependencies import get_alarm_bus, get_db_connection
 from core.metrics import observe_alarm_path_stage_latency_ms
-
-_SSE_COMMENT = b": keep-alive\n\n"
 from models import AlarmEvent
 from processing.alarm_bus import AlarmBus, is_subscriber_disconnected
+
+_SSE_COMMENT = b": keep-alive\n\n"
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

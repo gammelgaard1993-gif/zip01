@@ -1,0 +1,55 @@
+# Azure Pipelines equivalent of .github/workflows/ci.yml.
+#
+# This repository is hosted on GitHub, so GitHub Actions is the pipeline that actually runs here
+# (see .github/workflows/ci.yml). This file is kept alongside it as a like-for-like Azure DevOps
+# translation of the same gate -- same steps, same dependency install, same lint + test commands
+# -- so it can be dropped into an Azure Repos/Azure Pipelines project unchanged.
+#
+# Trunk-based development: main is always releasable. Every push to main and every PR targeting
+# main runs the same gate (lint + tests) before merge.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  PYTHON_VERSION: "3.12"
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: $(PYTHON_VERSION)
+    displayName: "Set up Python"
+
+  - task: Cache@2
+    inputs:
+      key: 'python | "$(Agent.OS)" | requirements.txt | requirements-dev.txt'
+      restoreKeys: |
+        python | "$(Agent.OS)"
+      path: $(Pipeline.Workspace)/.pip_cache
+    displayName: "Cache pip packages"
+
+  - script: |
+      python -m pip install --cache-dir $(Pipeline.Workspace)/.pip_cache \
+        -r requirements.txt -r requirements-dev.txt
+    displayName: "Install dependencies"
+
+  - script: python -m ruff check .
+    displayName: "Lint (ruff)"
+
+  - script: python -m unittest discover -s tests -v
+    displayName: "Run test suite"
+    # No Redis service container needed: tests fake/patch Redis directly (see tests/fakes.py).
+    # USE_FAKE_REDIS is deliberately NOT set here -- one test
+    # (test_redis_client_initialization_pings_server) asserts core.redis_client falls through
+    # to a real redis.from_url() call (mocked), which USE_FAKE_REDIS would short-circuit,
+    # breaking that test.

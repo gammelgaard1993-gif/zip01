@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone

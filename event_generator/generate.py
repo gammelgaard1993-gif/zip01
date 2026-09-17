@@ -195,7 +195,7 @@ def run(devices: list, target: str, duration: float, rps_per_device: float,
         # Tight loop, but yield briefly so we're not pegging a core
         time.sleep(0.005)
 
-    print(f"\nGround truth:")
+    print("\nGround truth:")
     print(f"  total events sent:    {gt['total']} (incl. fall jitter)")
     print(f"  distinct falls:       {gt['distinct_falls']} (dedup target)")
     print(f"  HTTP sent ok:         {sender.sent}")

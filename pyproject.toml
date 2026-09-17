@@ -1,0 +1,12 @@
+[tool.ruff]
+# 100 chars is documented guidance (not firm) in .github/instructions/code-style.instructions.md,
+# so line-length is deliberately not enforced here (E501 is excluded below) rather than punishing
+# an intentionally soft guideline.
+line-length = 100
+
+[tool.ruff.lint]
+# Conservative baseline: pyflakes (real bugs -- unused imports/names, undefined names, etc.) and
+# pycodestyle errors, minus line-length. Intentionally not pulling in pyupgrade/bugbear/etc. yet,
+# to keep the initial CI gate signal-only; expand incrementally in follow-up PRs.
+select = ["E", "F"]
+ignore = ["E501"]

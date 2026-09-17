@@ -106,7 +106,7 @@ def main():
         elif delta < 0:
             print(f"  ⚠ {-delta} missing alarms — some falls were dropped or filtered out")
         else:
-            print(f"  ✓ alarm count matches distinct falls")
+            print("  ✓ alarm count matches distinct falls")
 
     # Sample per-room occupancy on a known room
     sample_room = "room_000"
