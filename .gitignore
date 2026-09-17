@@ -42,3 +42,7 @@ Thumbs.db
 _bench.py
 helpers/
 
+# Generated load-test report artifacts
+loadtest-dashboard*.html
+.dashboard-check.*
+
